@@ -1,0 +1,103 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.ricky.screentime",
+  "name": "Screen Time",
+  "version": "1.0.0",
+  "author": "ricky",
+  "license": "MIT",
+  "description": "Daily screen time tracking with a GitHub-style contribution heatmap. Digital Wellbeing for your Omarchy bar, fully local.",
+  "kinds": ["service", "bar-widget"],
+  "keepLoaded": true,
+  "entryPoints": {
+    "service": "Service.qml",
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Screen Time",
+    "description": "Today's screen time in the bar, with a year heatmap of daily usage boxes and a per-app breakdown.",
+    "category": "Info",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "dailyGoalHours": 6,
+      "idleTimeoutSec": 120,
+      "barMode": "strip",
+      "gridPalette": "accent",
+      "historyMonths": 6,
+      "weekStartsMonday": true,
+      "detailRetentionDays": 120,
+      "ignoredApps": ""
+    },
+    "schema": [
+      {
+        "key": "dailyGoalHours",
+        "type": "integer",
+        "label": "Daily limit (hours)",
+        "description": "Heatmap intensity and the over-limit colour are scaled against this.",
+        "min": 1,
+        "max": 24,
+        "step": 1,
+        "defaultValue": 6
+      },
+      {
+        "key": "historyMonths",
+        "type": "integer",
+        "label": "Months of history in the heatmap",
+        "description": "How many months of daily boxes the panel shows at once. Six fits comfortably; more makes the boxes smaller.",
+        "min": 1,
+        "max": 24,
+        "step": 1,
+        "defaultValue": 6
+      },
+      {
+        "key": "idleTimeoutSec",
+        "type": "integer",
+        "label": "Count as idle after (seconds)",
+        "description": "Time stops accruing once there has been no input for this long.",
+        "min": 30,
+        "max": 1800,
+        "step": 30,
+        "defaultValue": 120
+      },
+      {
+        "key": "barMode",
+        "type": "string",
+        "label": "Bar display",
+        "description": "strip = boxes + total, total = time only, icon = glyph only.",
+        "options": ["strip", "total", "icon"],
+        "defaultValue": "strip"
+      },
+      {
+        "key": "gridPalette",
+        "type": "string",
+        "label": "Heatmap palette",
+        "description": "accent = theme accent like GitHub, traffic = green under limit through red over it.",
+        "options": ["accent", "traffic"],
+        "defaultValue": "accent"
+      },
+      {
+        "key": "weekStartsMonday",
+        "type": "boolean",
+        "label": "Start weeks on Monday",
+        "defaultValue": true
+      },
+      {
+        "key": "ignoredApps",
+        "type": "string",
+        "label": "Also ignore these apps",
+        "description": "Comma-separated app ids that should never count. Screensaver and lock screens are always ignored. Trailing * matches a prefix, e.g. steam_app_*",
+        "defaultValue": ""
+      },
+      {
+        "key": "detailRetentionDays",
+        "type": "integer",
+        "label": "Keep per-app detail for (days)",
+        "description": "Daily totals are kept forever; per-app detail older than this is dropped.",
+        "min": 7,
+        "max": 3650,
+        "step": 7,
+        "defaultValue": 120
+      }
+    ]
+  }
+}

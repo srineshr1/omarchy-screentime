@@ -1,0 +1,780 @@
+#!/usr/bin/env python3
+"""screentime - local screen time store for the Omarchy Screen Time plugin.
+
+The QML service never touches disk. It accrues focused seconds in memory and
+hands them to `commit`, which is the only writer. Everything else reads.
+
+Store: $XDG_DATA_HOME/omarchy-screentime/history.json
+
+    {
+      "version": 1,
+      "days": {
+        "2026-08-24": {"total": 15043, "apps": {"firefox": 9001, "ghostty": 6042}}
+      }
+    }
+
+Seconds, integers. `total` is authoritative and survives detail pruning, so a
+day whose per-app breakdown has aged out still reports its total.
+
+Subcommands
+    commit <json>   merge accrued seconds, then print a fresh snapshot
+    snapshot        print the snapshot the UI renders
+    today           human-readable today
+    week            human-readable last 7 days
+    year [YYYY]     ASCII contribution heatmap in the terminal
+    json            dump the raw store
+    prune           drop per-app detail older than the retention window
+    path            print the store path
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import sys
+import tempfile
+from datetime import date, datetime, timedelta
+
+VERSION = 1
+LEVELS = ["NONE", "L1", "L2", "L3", "L4", "OVER"]
+MONTH_NAMES = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
+               "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+
+# appId -> display name, for the cases a .desktop lookup misses or gets ugly.
+ALIASES = {
+    "org.mozilla.firefox": "Firefox",
+    "firefox": "Firefox",
+    "firefoxdeveloperedition": "Firefox Developer Edition",
+    "chromium": "Chromium",
+    "google-chrome": "Chrome",
+    "brave-browser": "Brave",
+    "com.mitchellh.ghostty": "Ghostty",
+    "ghostty": "Ghostty",
+    "org.wezfurlong.wezterm": "WezTerm",
+    "foot": "foot",
+    "kitty": "kitty",
+    "alacritty": "Alacritty",
+    "code": "VS Code",
+    "code-oss": "VS Code",
+    "vscodium": "VSCodium",
+    "dev.zed.zed": "Zed",
+    "zed": "Zed",
+    "neovide": "Neovide",
+    "nvim": "Neovim",
+    "obsidian": "Obsidian",
+    "org.telegram.desktop": "Telegram",
+    "discord": "Discord",
+    "vesktop": "Vesktop",
+    "slack": "Slack",
+    "signal": "Signal",
+    "spotify": "Spotify",
+    "com.spotify.client": "Spotify",
+    "mpv": "mpv",
+    "vlc": "VLC",
+    "steam": "Steam",
+    "org.gnome.nautilus": "Files",
+    "nautilus": "Files",
+    "thunar": "Thunar",
+    "org.pwmt.zathura": "Zathura",
+    "zathura": "Zathura",
+    "imv": "imv",
+    "gimp": "GIMP",
+    "org.inkscape.inkscape": "Inkscape",
+    "blender": "Blender",
+    "libreoffice": "LibreOffice",
+    "1password": "1Password",
+    "org.keepassxc.keepassxc": "KeePassXC",
+    "whatsapp": "WhatsApp",
+    "hyprland": "Desktop",
+}
+
+_DESKTOP_CACHE: dict[str, str | None] = {}
+
+
+# ---------------------------------------------------------------- store paths
+
+
+def data_dir() -> str:
+    base = os.environ.get("XDG_DATA_HOME") or os.path.join(
+        os.path.expanduser("~"), ".local", "share"
+    )
+    # Deliberately NOT <data>/omarchy/: on a real Omarchy install
+    # ~/.local/share/omarchy is a symlink to the root-owned /usr/share/omarchy,
+    # so writing there fails with EACCES for every user.
+    return os.path.join(base, "omarchy-screentime")
+
+
+def store_path() -> str:
+    return os.path.join(data_dir(), "history.json")
+
+
+def load_store() -> dict:
+    try:
+        with open(store_path(), "r", encoding="utf-8") as handle:
+            raw = json.load(handle)
+    except (OSError, ValueError):
+        return {"version": VERSION, "days": {}}
+    if not isinstance(raw, dict):
+        return {"version": VERSION, "days": {}}
+    days = raw.get("days")
+    if not isinstance(days, dict):
+        days = {}
+    clean: dict[str, dict] = {}
+    for key, value in days.items():
+        if not is_day_key(key) or not isinstance(value, dict):
+            continue
+        apps = value.get("apps")
+        apps = apps if isinstance(apps, dict) else {}
+        clean[key] = {
+            "total": max(0, to_int(value.get("total"))),
+            "apps": {
+                str(app): max(0, to_int(secs))
+                for app, secs in apps.items()
+                if to_int(secs) > 0
+            },
+        }
+    return {"version": VERSION, "days": clean}
+
+
+def save_store(store: dict) -> None:
+    """Atomic: write a sibling temp file then rename over the target."""
+    target = store_path()
+    os.makedirs(os.path.dirname(target), exist_ok=True)
+    handle = tempfile.NamedTemporaryFile(
+        mode="w",
+        encoding="utf-8",
+        dir=os.path.dirname(target),
+        prefix=".history-",
+        suffix=".json",
+        delete=False,
+    )
+    try:
+        with handle:
+            json.dump(store, handle, separators=(",", ":"), sort_keys=True)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(handle.name, target)
+    except BaseException:
+        try:
+            os.unlink(handle.name)
+        except OSError:
+            pass
+        raise
+
+
+# ------------------------------------------------------------------- helpers
+
+
+DAY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def is_day_key(value: object) -> bool:
+    if not isinstance(value, str) or not DAY_RE.match(value):
+        return False
+    try:
+        date.fromisoformat(value)
+    except ValueError:
+        return False
+    return True
+
+
+def to_int(value: object) -> int:
+    try:
+        number = int(float(value))  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return 0
+    return number
+
+
+def day_key(value: date) -> str:
+    return value.isoformat()
+
+
+def month_start(value: date, delta: int = 0) -> date:
+    """First of the month, `delta` months away from `value`'s month."""
+    total = value.year * 12 + (value.month - 1) + delta
+    year, month = divmod(total, 12)
+    return date(year, month + 1, 1)
+
+
+def month_end(value: date) -> date:
+    return month_start(value, 1) - timedelta(days=1)
+
+
+def normalize_months(months: object) -> int:
+    """A non-positive or unparseable count means "use the default", not "one
+    month" — clamping junk to a single column would look like a bug."""
+    count = to_int(months)
+    if count <= 0:
+        count = 6
+    return min(24, count)
+
+
+def window_bounds(months: int, offset: int, today: date) -> tuple:
+    """The rolling window the heatmap draws.
+
+    Covers whole months so the month captions line up, ends today when the
+    window includes the current month, and never runs into the future.
+    """
+    count = normalize_months(months)
+    offset = max(0, to_int(offset))
+    last_month = month_start(today, -offset)
+    start = month_start(last_month, -(count - 1))
+    end = today if offset == 0 else month_end(last_month)
+    return start, min(end, today)
+
+
+def range_label(start: date, end: date) -> str:
+    left = MONTH_NAMES[start.month - 1]
+    right = MONTH_NAMES[end.month - 1]
+    if start.year == end.year:
+        return f"{left} \u2013 {right} {end.year}"
+    return f"{left} {start.year} \u2013 {right} {end.year}"
+
+
+def format_duration(seconds: int) -> str:
+    seconds = max(0, to_int(seconds))
+    hours, rest = divmod(seconds, 3600)
+    minutes = rest // 60
+    if hours and minutes:
+        return f"{hours}h {minutes}m"
+    if hours:
+        return f"{hours}h"
+    if minutes:
+        return f"{minutes}m"
+    return f"{seconds}s" if seconds else "0m"
+
+
+def pretty_name(app_id: str) -> str:
+    """A human name for an appId, without ever failing."""
+    raw = str(app_id or "").strip()
+    if not raw:
+        return "Unknown"
+    lowered = raw.lower()
+    if lowered in ALIASES:
+        return ALIASES[lowered]
+    from_desktop = desktop_name(raw)
+    if from_desktop:
+        return from_desktop
+    # Reverse-DNS ids collapse to their last component: com.foo.BarBaz -> BarBaz
+    tail = raw.split(".")[-1] if "." in raw else raw
+    tail = tail.replace("_", " ").replace("-", " ").strip()
+    if not tail:
+        return raw
+    if tail.islower():
+        return tail[:1].upper() + tail[1:]
+    return tail
+
+
+def desktop_name(app_id: str) -> str | None:
+    if app_id in _DESKTOP_CACHE:
+        return _DESKTOP_CACHE[app_id]
+    result: str | None = None
+    home = os.path.expanduser("~")
+    roots = [
+        os.path.join(home, ".local", "share", "applications"),
+        "/usr/local/share/applications",
+        "/usr/share/applications",
+        "/var/lib/flatpak/exports/share/applications",
+        os.path.join(home, ".local", "share", "flatpak", "exports", "share", "applications"),
+    ]
+    for root in roots:
+        candidate = os.path.join(root, f"{app_id}.desktop")
+        if not os.path.isfile(candidate):
+            continue
+        try:
+            with open(candidate, "r", encoding="utf-8", errors="replace") as handle:
+                in_entry = False
+                for line in handle:
+                    line = line.strip()
+                    if line.startswith("["):
+                        in_entry = line == "[Desktop Entry]"
+                        continue
+                    if in_entry and line.startswith("Name="):
+                        result = line[5:].strip() or None
+                        break
+        except OSError:
+            result = None
+        if result:
+            break
+    _DESKTOP_CACHE[app_id] = result
+    return result
+
+
+def level_for(seconds: int, goal_seconds: int) -> str:
+    if seconds <= 0:
+        return "NONE"
+    goal = max(1, goal_seconds)
+    ratio = seconds / goal
+    if ratio > 1.0:
+        return "OVER"
+    if ratio >= 0.75:
+        return "L4"
+    if ratio >= 0.5:
+        return "L3"
+    if ratio >= 0.25:
+        return "L2"
+    return "L1"
+
+
+# -------------------------------------------------------------------- commit
+
+
+def merge_commit(store: dict, payload: object) -> int:
+    """Fold {date: {appId: seconds}} into the store. Returns seconds added."""
+    if isinstance(payload, str):
+        try:
+            payload = json.loads(payload)
+        except ValueError:
+            return 0
+    if not isinstance(payload, dict):
+        return 0
+    buckets = payload.get("days", payload)
+    if not isinstance(buckets, dict):
+        return 0
+
+    days = store.setdefault("days", {})
+    added = 0
+    for raw_day, apps in buckets.items():
+        if not is_day_key(raw_day) or not isinstance(apps, dict):
+            continue
+        accepted: dict[str, int] = {}
+        for raw_app, raw_secs in apps.items():
+            secs = to_int(raw_secs)
+            # A single commit covering more than a day of one app is a bug
+            # upstream (a stuck clock, a resumed suspend); refuse it.
+            if secs <= 0 or secs > 86400:
+                continue
+            app = str(raw_app).strip() or "unknown"
+            accepted[app] = accepted.get(app, 0) + secs
+        # A batch that contributes nothing must not leave an empty day behind,
+        # or a stream of rejected commits would fill the store with blanks.
+        if not accepted:
+            continue
+        entry = days.setdefault(raw_day, {"total": 0, "apps": {}})
+        entry.setdefault("total", 0)
+        entry.setdefault("apps", {})
+        for app, secs in accepted.items():
+            entry["apps"][app] = entry["apps"].get(app, 0) + secs
+            entry["total"] += secs
+            added += secs
+        # Totals never dip below the breakdown they came from.
+        entry["total"] = max(entry["total"], sum(entry["apps"].values()))
+    return added
+
+
+def prune(store: dict, retention_days: int, today: date) -> int:
+    """Drop per-app detail past the window. Daily totals are kept forever."""
+    cutoff = today - timedelta(days=max(1, retention_days))
+    dropped = 0
+    for key, entry in store.get("days", {}).items():
+        try:
+            when = date.fromisoformat(key)
+        except ValueError:
+            continue
+        if when >= cutoff:
+            continue
+        if entry.get("apps"):
+            entry["total"] = max(to_int(entry.get("total")), sum(entry["apps"].values()))
+            entry["apps"] = {}
+            dropped += 1
+    return dropped
+
+
+# ------------------------------------------------------------------ snapshot
+
+
+def total_for(store: dict, key: str) -> int:
+    entry = store.get("days", {}).get(key)
+    return to_int(entry.get("total")) if isinstance(entry, dict) else 0
+
+
+def apps_for(store: dict, key: str) -> dict:
+    entry = store.get("days", {}).get(key)
+    if not isinstance(entry, dict):
+        return {}
+    apps = entry.get("apps")
+    return apps if isinstance(apps, dict) else {}
+
+
+def app_list(apps: dict, total: int, limit: int = 0) -> list:
+    rows = sorted(apps.items(), key=lambda kv: (-kv[1], kv[0]))
+    if limit > 0:
+        rows = rows[:limit]
+    denominator = max(1, total)
+    return [
+        {
+            "id": app,
+            "name": pretty_name(app),
+            "seconds": secs,
+            "share": round(secs / denominator, 4),
+            "label": format_duration(secs),
+        }
+        for app, secs in rows
+    ]
+
+
+def build_grid(store: dict, first: date, last: date, goal_seconds: int,
+               monday_first: bool) -> list:
+    """GitHub layout: one column per week, seven rows of weekdays.
+
+    Cells outside [first, last] are emitted as padding so every column has
+    exactly seven rows and the weekday rows stay aligned.
+    """
+    if last < first:
+        return []
+
+    # Back up to the start of the week containing `first` so rows line up.
+    if monday_first:
+        offset = first.weekday()  # Monday == 0
+    else:
+        offset = (first.weekday() + 1) % 7  # Sunday == 0
+    start = first - timedelta(days=offset)
+
+    weeks: list = []
+    cursor = start
+    index = 0
+    while cursor <= last:
+        days = []
+        for row in range(7):
+            current = cursor + timedelta(days=row)
+            if current < first or current > last:
+                days.append({
+                    "date": "",
+                    "seconds": 0,
+                    "level": "NONE",
+                    "weekday": row,
+                    "outOfRange": True,
+                })
+                continue
+            key = day_key(current)
+            seconds = total_for(store, key)
+            days.append({
+                "date": key,
+                "seconds": seconds,
+                "level": level_for(seconds, goal_seconds),
+                "weekday": row,
+                "label": format_duration(seconds),
+                "month": current.month,
+                "day": current.day,
+                "outOfRange": False,
+            })
+        weeks.append({"index": index, "startDate": day_key(cursor), "days": days})
+        cursor += timedelta(days=7)
+        index += 1
+    return weeks
+
+
+def build_weeks(store: dict, year: int, goal_seconds: int, monday_first: bool,
+                today: date) -> list:
+    """A whole calendar year, clipped at today for the current year."""
+    first = date(year, 1, 1)
+    last = date(year, 12, 31)
+    if year == today.year:
+        last = today
+    return build_grid(store, first, last, goal_seconds, monday_first)
+
+
+def recent_days(store: dict, count: int, goal_seconds: int, today: date) -> list:
+    out = []
+    for step in range(count - 1, -1, -1):
+        current = today - timedelta(days=step)
+        key = day_key(current)
+        seconds = total_for(store, key)
+        out.append({
+            "date": key,
+            "seconds": seconds,
+            "level": level_for(seconds, goal_seconds),
+            "label": format_duration(seconds),
+            "weekday": current.weekday(),
+        })
+    return out
+
+
+def under_goal_streak(store: dict, goal_seconds: int, today: date) -> int:
+    """Consecutive tracked days, ending yesterday or today, at or under goal."""
+    streak = 0
+    cursor = today
+    if total_for(store, day_key(cursor)) == 0:
+        cursor -= timedelta(days=1)
+    while True:
+        key = day_key(cursor)
+        seconds = total_for(store, key)
+        if seconds == 0 or seconds > goal_seconds:
+            break
+        streak += 1
+        cursor -= timedelta(days=1)
+    return streak
+
+
+def rolling_apps(store: dict, days: int, today: date) -> tuple:
+    apps: dict = {}
+    total = 0
+    for step in range(days):
+        key = day_key(today - timedelta(days=step))
+        for app, secs in apps_for(store, key).items():
+            apps[app] = apps.get(app, 0) + to_int(secs)
+        total += total_for(store, key)
+    return apps, total
+
+
+def build_snapshot(store: dict, goal_hours: int, monday_first: bool, year: int | None,
+                   today: date, selected: str | None = None,
+                   months: int = 6, offset: int = 0) -> dict:
+    goal_seconds = max(1, to_int(goal_hours)) * 3600
+    days = store.get("days", {})
+    tracked = sorted(k for k, v in days.items() if to_int(v.get("total")) > 0)
+    years = sorted({int(k[:4]) for k in tracked})
+    if today.year not in years:
+        years.append(today.year)
+        years.sort()
+
+    today_key = day_key(today)
+    today_total = total_for(store, today_key)
+    today_apps = apps_for(store, today_key)
+    yesterday_total = total_for(store, day_key(today - timedelta(days=1)))
+
+    week = recent_days(store, 7, goal_seconds, today)
+    week_total = sum(entry["seconds"] for entry in week)
+
+    # The heatmap draws a rolling window of whole months rather than a full
+    # calendar year: 53 columns do not fit a bar popup without clipping the
+    # newest day, and half a year of boxes is both legible and enough context.
+    start, end = window_bounds(months, offset, today)
+    weeks = build_grid(store, start, end, goal_seconds, monday_first)
+    range_days = [k for k in tracked if start.isoformat() <= k <= end.isoformat()]
+    range_total = sum(total_for(store, k) for k in range_days)
+
+    oldest = tracked[0] if tracked else ""
+    all_total = sum(total_for(store, k) for k in tracked)
+    best_key = max(tracked, key=lambda k: total_for(store, k), default="")
+
+    month30_apps, month30_total = rolling_apps(store, 30, today)
+
+    # A clicked heatmap box asks for one specific day's breakdown. Days whose
+    # per-app detail has aged out still report a total, so the UI can say
+    # "detail expired" rather than "no usage".
+    selected_key = selected if is_day_key(selected) else ""
+    selected_total = total_for(store, selected_key) if selected_key else 0
+    selected_apps = apps_for(store, selected_key) if selected_key else {}
+
+    return {
+        "ok": True,
+        "generatedAt": datetime.now().isoformat(timespec="seconds"),
+        "today": today_key,
+        "todayTotal": today_total,
+        "todayLabel": format_duration(today_total),
+        "todayLevel": level_for(today_total, goal_seconds),
+        "todayApps": app_list(today_apps, today_total),
+        "yesterdayTotal": yesterday_total,
+        "yesterdayLabel": format_duration(yesterday_total),
+        "goalHours": max(1, to_int(goal_hours)),
+        "goalSeconds": goal_seconds,
+        "overGoal": today_total > goal_seconds,
+        "weeks": weeks,
+        "weekStartsMonday": bool(monday_first),
+        "months": normalize_months(months),
+        "offset": max(0, to_int(offset)),
+        "rangeStart": start.isoformat(),
+        "rangeEnd": end.isoformat(),
+        "rangeLabel": range_label(start, end),
+        "rangeTotal": range_total,
+        "rangeTotalLabel": format_duration(range_total),
+        "rangeDaysTracked": len(range_days),
+        "rangeDailyAverage": range_total // len(range_days) if range_days else 0,
+        # Older data exists before this window, so "back" would show something.
+        "canGoBack": bool(oldest and oldest < start.isoformat()),
+        "canGoForward": max(0, to_int(offset)) > 0,
+        "year": today.year,
+        "availableYears": years,
+        "weekDays": week,
+        "weekTotal": week_total,
+        "weekLabel": format_duration(week_total),
+        "weekDailyAverage": week_total // 7,
+        "streak": under_goal_streak(store, goal_seconds, today),
+        "bestDay": {
+            "date": best_key,
+            "seconds": total_for(store, best_key),
+            "label": format_duration(total_for(store, best_key)),
+        } if best_key else {"date": "", "seconds": 0, "label": "0m"},
+        "topApps": app_list(month30_apps, month30_total, 12),
+        "allTimeTotal": all_total,
+        "allTimeLabel": format_duration(all_total),
+        "daysTracked": len(tracked),
+        "selectedDay": selected_key,
+        "selectedTotal": selected_total,
+        "selectedLabel": format_duration(selected_total),
+        "selectedApps": app_list(selected_apps, selected_total),
+        "selectedDetailExpired": bool(selected_key and selected_total > 0 and not selected_apps),
+        "storePath": store_path(),
+    }
+
+
+# ------------------------------------------------------------------ commands
+
+
+def emit(payload: dict) -> None:
+    json.dump(payload, sys.stdout, separators=(",", ":"))
+    sys.stdout.write("\n")
+
+
+def cmd_commit(args) -> int:
+    store = load_store()
+    payload = args.payload
+    if payload == "-":
+        payload = sys.stdin.read()
+    added = merge_commit(store, payload)
+    today = date.today()
+    changed = added > 0
+    if args.prune:
+        changed = prune(store, args.retention, today) > 0 or changed
+    if changed:
+        save_store(store)
+    snapshot = build_snapshot(store, args.goal, args.monday, args.year, today,
+                              args.day, args.months, args.offset)
+    snapshot["committed"] = added
+    emit(snapshot)
+    return 0
+
+
+def cmd_snapshot(args) -> int:
+    emit(build_snapshot(load_store(), args.goal, args.monday, args.year,
+                        date.today(), args.day, args.months, args.offset))
+    return 0
+
+
+def cmd_today(args) -> int:
+    store = load_store()
+    today = date.today()
+    total = total_for(store, day_key(today))
+    print(f"Screen time today: {format_duration(total)}")
+    rows = app_list(apps_for(store, day_key(today)), total, 10)
+    if not rows:
+        print("  no usage recorded yet")
+        return 0
+    width = max(len(row["name"]) for row in rows)
+    for row in rows:
+        bar = "\u2588" * max(1, round(row["share"] * 24))
+        print(f"  {row['name']:<{width}}  {row['label']:>7}  {bar}")
+    return 0
+
+
+def cmd_week(args) -> int:
+    store = load_store()
+    today = date.today()
+    goal = max(1, to_int(args.goal)) * 3600
+    rows = recent_days(store, 7, goal, today)
+    peak = max((row["seconds"] for row in rows), default=0)
+    total = sum(row["seconds"] for row in rows)
+    print(f"Last 7 days: {format_duration(total)} (avg {format_duration(total // 7)}/day)")
+    for row in rows:
+        name = datetime.fromisoformat(row["date"]).strftime("%a %d %b")
+        length = round(row["seconds"] / peak * 28) if peak else 0
+        bar = "\u2588" * length
+        print(f"  {name}  {row['label']:>7}  {bar}")
+    return 0
+
+
+def cmd_year(args) -> int:
+    store = load_store()
+    today = date.today()
+    goal = max(1, to_int(args.goal)) * 3600
+    year = args.year or today.year
+    weeks = build_weeks(store, year, goal, args.monday, today)
+    glyphs = {"NONE": "\u00b7", "L1": "\u2591", "L2": "\u2592", "L3": "\u2593", "L4": "\u2588", "OVER": "\u2588"}
+    labels = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"] if args.monday else \
+             ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
+    year_total = sum(
+        cell["seconds"]
+        for week in weeks
+        for cell in week["days"]
+        if not cell["outOfRange"]
+    )
+    print(f"{year}  \u00b7  {format_duration(year_total)} total  \u00b7  limit {args.goal}h/day")
+    for row in range(7):
+        cells = "".join(
+            " " if week["days"][row]["outOfRange"] else glyphs[week["days"][row]["level"]]
+            for week in weeks
+        )
+        print(f"  {labels[row]} {cells}")
+    legend = glyphs["L1"] + glyphs["L2"] + glyphs["L3"] + glyphs["L4"]
+    print(f"      less {legend} more")
+    return 0
+
+
+def cmd_json(args) -> int:
+    json.dump(load_store(), sys.stdout, indent=2, sort_keys=True)
+    sys.stdout.write("\n")
+    return 0
+
+
+def cmd_prune(args) -> int:
+    store = load_store()
+    dropped = prune(store, args.retention, date.today())
+    if dropped:
+        save_store(store)
+    print(f"pruned per-app detail from {dropped} day(s)")
+    return 0
+
+
+def cmd_path(args) -> int:
+    print(store_path())
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="screentime", description=__doc__)
+    parser.add_argument("--goal", type=int, default=6, help="daily limit in hours")
+    parser.add_argument("--year", type=int, default=None, help="year for the heatmap")
+    parser.add_argument("--retention", type=int, default=120,
+                        help="days of per-app detail to keep")
+    parser.add_argument("--day", default=None, metavar="YYYY-MM-DD",
+                        help="also report this day's per-app breakdown")
+    parser.add_argument("--months", type=int, default=6,
+                        help="months of history in the heatmap window (default 6)")
+    parser.add_argument("--offset", type=int, default=0,
+                        help="shift the heatmap window back by this many months")
+    week = parser.add_mutually_exclusive_group()
+    week.add_argument("--monday", dest="monday", action="store_true", default=True,
+                      help="weeks start on Monday (default)")
+    week.add_argument("--sunday", dest="monday", action="store_false",
+                      help="weeks start on Sunday, like GitHub")
+
+    subs = parser.add_subparsers(dest="command")
+
+    commit = subs.add_parser("commit", help="merge accrued seconds and print a snapshot")
+    commit.add_argument("payload", help='{"days": {"YYYY-MM-DD": {"appId": seconds}}} or - for stdin')
+    commit.add_argument("--prune", action="store_true", help="prune detail after merging")
+    commit.set_defaults(func=cmd_commit)
+
+    subs.add_parser("snapshot", help="print the snapshot the UI renders").set_defaults(func=cmd_snapshot)
+    subs.add_parser("today", help="human-readable today").set_defaults(func=cmd_today)
+    subs.add_parser("week", help="human-readable last 7 days").set_defaults(func=cmd_week)
+    subs.add_parser("year", help="ASCII contribution heatmap").set_defaults(func=cmd_year)
+    subs.add_parser("json", help="dump the raw store").set_defaults(func=cmd_json)
+    subs.add_parser("prune", help="drop aged per-app detail").set_defaults(func=cmd_prune)
+    subs.add_parser("path", help="print the store path").set_defaults(func=cmd_path)
+    return parser
+
+
+def main(argv: list) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if not getattr(args, "func", None):
+        args.func = cmd_today
+    try:
+        return args.func(args)
+    except BrokenPipeError:
+        return 0
+    except Exception as error:  # never let the bar see a traceback
+        if args.command in ("commit", "snapshot"):
+            emit({"ok": False, "error": str(error)[:240]})
+            return 0
+        print(f"screentime: {error}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
