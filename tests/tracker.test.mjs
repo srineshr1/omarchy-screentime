@@ -164,6 +164,92 @@ test("ignored apps accrue nothing even while focused and active", () => {
   assert.deepEqual(bufferOf(state, "2026-08-24"), { firefox: 5 })
 })
 
+test("composeKey joins an app and its detail, and omits an empty detail", () => {
+  assert.equal(Tracker.composeKey("com.mitchellh.ghostty", "opencode"),
+    "com.mitchellh.ghostty/opencode")
+  assert.equal(Tracker.composeKey("helium", "YouTube"), "helium/YouTube")
+  assert.equal(Tracker.composeKey("firefox", ""), "firefox")
+  assert.equal(Tracker.composeKey("firefox", null), "firefox")
+  assert.equal(Tracker.composeKey("", "opencode"), "")
+})
+
+test("keyApp and keyDetail split a store key apart", () => {
+  assert.equal(Tracker.keyApp("com.mitchellh.ghostty/opencode"), "com.mitchellh.ghostty")
+  assert.equal(Tracker.keyDetail("com.mitchellh.ghostty/opencode"), "opencode")
+  assert.equal(Tracker.keyApp("firefox"), "firefox")
+  assert.equal(Tracker.keyDetail("firefox"), "")
+  // Only the first slash is a boundary, so a detail with a slash cannot
+  // smuggle in a fake app.
+  assert.equal(Tracker.keyApp("helium/a/b"), "helium")
+  assert.equal(Tracker.keyDetail("helium/a/b"), "a/b")
+})
+
+test("normalizeDetail strips slashes, control characters, and over-long text", () => {
+  assert.equal(Tracker.normalizeDetail("opencode"), "opencode")
+  assert.equal(Tracker.normalizeDetail("  YouTube  "), "YouTube")
+  assert.equal(Tracker.normalizeDetail("a/b"), "a b")
+  assert.equal(Tracker.normalizeDetail("a\nb\tc"), "a b c")
+  assert.equal(Tracker.normalizeDetail(""), "")
+  assert.equal(Tracker.normalizeDetail(null), "")
+  assert.equal(Tracker.normalizeDetail("x".repeat(200)).length, 40)
+})
+
+test("normalizeKey keeps the app/detail boundary that normalizeAppId destroys", () => {
+  // normalizeAppId strips paths by keeping the last component, which would
+  // reduce a composite key to just its detail.
+  assert.equal(Tracker.normalizeAppId("ghostty/opencode"), "opencode")
+  assert.equal(Tracker.normalizeKey("ghostty/opencode"), "ghostty/opencode")
+  assert.equal(Tracker.normalizeKey("firefox"), "firefox")
+  assert.equal(Tracker.normalizeKey(""), "")
+  // A real path is still treated as a path, not as a composite key.
+  assert.equal(Tracker.normalizeKey("/usr/bin/ghostty"), "ghostty")
+})
+
+test("detail is tracked as its own row, and switching detail attributes cleanly", () => {
+  const key = (app, detail) => Tracker.composeKey(app, detail)
+  let state = Tracker.observe(Tracker.emptyState(),
+    opts(noon, key("ghostty", "opencode"), true))
+  state = Tracker.observe(state, opts(noon + INTERVAL, key("ghostty", "opencode"), true))
+  assert.deepEqual(bufferOf(state, "2026-08-24"), { "ghostty/opencode": 5 })
+
+  // Same terminal, different program: a separate row, and the first five
+  // seconds stay with opencode.
+  state = Tracker.observe(state, opts(noon + INTERVAL * 2, key("ghostty", "claude"), true))
+  state = Tracker.observe(state, opts(noon + INTERVAL * 3, key("ghostty", "claude"), true))
+  assert.deepEqual(bufferOf(state, "2026-08-24"), {
+    "ghostty/opencode": 10,
+    "ghostty/claude": 5
+  })
+})
+
+test("browser sites accrue separately from each other", () => {
+  let state = Tracker.rebase(Tracker.emptyState(), noon)
+  // 30 minutes of YouTube, then 5 of GitHub.
+  for (let i = 1; i <= 360; i++) {
+    state = Tracker.observe(state, opts(noon + i * INTERVAL, "helium/YouTube", true))
+  }
+  for (let i = 361; i <= 420; i++) {
+    state = Tracker.observe(state, opts(noon + i * INTERVAL, "helium/GitHub", true))
+  }
+  const day = bufferOf(state, "2026-08-24")
+  assert.equal(day["helium/YouTube"], 1800)
+  assert.equal(day["helium/GitHub"], 295)
+})
+
+test("an ignored app stays ignored whatever detail is attached to it", () => {
+  const rules = Tracker.ignoreRules("")
+  assert.equal(Tracker.isIgnored("org.omarchy.screensaver/anything", rules), true)
+  assert.equal(Tracker.isIgnored("hyprlock/~", rules), true)
+  assert.equal(Tracker.isIgnored("helium/YouTube", rules), false)
+})
+
+test("a user ignore rule matches the app, not the detail", () => {
+  const rules = Tracker.ignoreRules("helium")
+  assert.equal(Tracker.isIgnored("helium/YouTube", rules), true)
+  // The detail alone must not be enough to trigger a rule.
+  assert.equal(Tracker.isIgnored("firefox/helium", rules), false)
+})
+
 test("normalizeAppId trims, strips paths, and bounds length", () => {
   assert.equal(Tracker.normalizeAppId("  firefox  "), "firefox")
   assert.equal(Tracker.normalizeAppId("/usr/bin/ghostty"), "ghostty")

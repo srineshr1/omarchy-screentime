@@ -1,0 +1,528 @@
+#!/usr/bin/env python3
+"""resolve-focus - what is actually happening inside the focused window.
+
+An app id alone says "Ghostty" or "Helium", which is not what you want to know.
+This turns that into "opencode", "~/Projects/Screentime" or "YouTube".
+
+    resolve-focus <appId> <title>            -> {"app":..,"detail":..,"kind":..}
+
+Two signals, cheapest first:
+
+1. The window title. Terminals report the running program or the working
+   directory there (Ghostty, kitty, WezTerm all do by default), and browsers
+   put the page title there. This is the primary signal because it is the only
+   one that works for terminals that keep every window in one process — Ghostty
+   runs all of its windows under a single pid, so walking that pid's children
+   cannot tell one window from another.
+
+2. The process tree, as a fallback for terminals whose title is uninformative
+   (a bare "foot" or "Alacritty"). Only used when it is unambiguous: if the
+   terminal pid has several foreground commands under it, we cannot say which
+   window is which and we return nothing rather than guess.
+
+Browser detail is deliberately the *site*, taken from the end of the title,
+never the page title itself. "how to fix X - Google Search" resolves to
+"Google Search"; a video resolves to "YouTube". The specific thing you were
+reading or searching for is dropped on the floor and never written to disk.
+
+Prints one JSON object and always exits 0. A resolver that throws would take
+the whole bar widget down with it, so every failure path returns no detail.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import socket
+import sys
+
+MAX_DETAIL = 40
+
+# Terminals: the title holds the running program or the cwd.
+TERMINALS = {
+    "com.mitchellh.ghostty", "ghostty",
+    "org.omarchy.terminal", "omarchy-terminal",
+    "foot", "footclient",
+    "kitty",
+    "alacritty",
+    "org.wezfurlong.wezterm", "wezterm",
+    "xterm", "urxvt", "st", "terminator", "tilix",
+    "org.gnome.terminal", "org.gnome.console", "kgx",
+    "konsole", "contour", "rio", "wave", "waveterm",
+}
+
+# Browsers: the title holds the page title, ending in the browser's own name.
+BROWSERS = {
+    "helium",
+    "firefox", "org.mozilla.firefox", "firefoxdeveloperedition",
+    "librewolf", "waterfox", "zen", "zen-alpha", "app.zen_browser.zen",
+    "chromium", "google-chrome", "google-chrome-stable",
+    "brave-browser", "brave",
+    "microsoft-edge", "microsoft-edge-stable",
+    "vivaldi-stable", "vivaldi",
+    "opera", "thorium-browser", "qutebrowser", "epiphany", "org.gnome.Epiphany",
+}
+
+# Browser names to strip off the end of a title before looking for the site.
+BROWSER_SUFFIXES = [
+    "helium", "mozilla firefox", "firefox developer edition", "firefox",
+    "librewolf", "waterfox", "zen browser", "zen", "chromium",
+    "google chrome", "chrome", "brave", "microsoft edge", "edge",
+    "vivaldi", "opera", "thorium", "qutebrowser", "gnome web", "epiphany",
+]
+
+# Interpreters and launchers that hide the real program name.
+WRAPPERS = {
+    "node", "nodejs", "node-mainthread", "deno", "bun",
+    "python", "python2", "python3", "pypy", "pypy3",
+    "ruby", "perl", "php", "java",
+    "sh", "bash", "dash", "zsh", "fish", "ksh", "tcsh",
+    "env", "sudo", "doas", "nice", "time", "strace",
+    "npm", "npx", "pnpm", "pnpx", "yarn", "bunx",
+    "uv", "uvx", "pipx", "poetry", "rye", "mise", "asdf",
+    "cargo", "go", "dotnet",
+}
+
+SHELLS = {"sh", "bash", "dash", "zsh", "fish", "ksh", "tcsh", "csh", "nu", "elvish"}
+
+# Sites worth naming. Order matters only for overlapping needles.
+SITES = [
+    ("youtube", "YouTube"),
+    ("youtube music", "YouTube Music"),
+    ("github", "GitHub"),
+    ("gitlab", "GitLab"),
+    ("codeberg", "Codeberg"),
+    ("stack overflow", "Stack Overflow"),
+    ("stackoverflow", "Stack Overflow"),
+    ("stack exchange", "Stack Exchange"),
+    ("reddit", "Reddit"),
+    ("hacker news", "Hacker News"),
+    ("lobsters", "Lobsters"),
+    ("wikipedia", "Wikipedia"),
+    ("google search", "Google Search"),
+    ("google docs", "Google Docs"),
+    ("google sheets", "Google Sheets"),
+    ("google slides", "Google Slides"),
+    ("google drive", "Google Drive"),
+    ("google maps", "Google Maps"),
+    ("google calendar", "Google Calendar"),
+    ("google meet", "Google Meet"),
+    ("gmail", "Gmail"),
+    ("outlook", "Outlook"),
+    ("proton mail", "Proton Mail"),
+    ("netflix", "Netflix"),
+    ("primevideo", "Prime Video"),
+    ("prime video", "Prime Video"),
+    ("disney+", "Disney+"),
+    ("hotstar", "Hotstar"),
+    ("twitch", "Twitch"),
+    ("spotify", "Spotify"),
+    ("soundcloud", "SoundCloud"),
+    ("instagram", "Instagram"),
+    ("facebook", "Facebook"),
+    ("linkedin", "LinkedIn"),
+    ("whatsapp", "WhatsApp"),
+    ("telegram", "Telegram"),
+    ("discord", "Discord"),
+    ("slack", "Slack"),
+    ("notion", "Notion"),
+    ("obsidian", "Obsidian"),
+    ("figma", "Figma"),
+    ("canva", "Canva"),
+    ("chatgpt", "ChatGPT"),
+    ("claude", "Claude"),
+    ("gemini", "Gemini"),
+    ("perplexity", "Perplexity"),
+    ("hugging face", "Hugging Face"),
+    ("kaggle", "Kaggle"),
+    ("leetcode", "LeetCode"),
+    ("coursera", "Coursera"),
+    ("udemy", "Udemy"),
+    ("medium", "Medium"),
+    ("dev community", "DEV"),
+    ("substack", "Substack"),
+    ("amazon", "Amazon"),
+    ("flipkart", "Flipkart"),
+    ("jira", "Jira"),
+    ("confluence", "Confluence"),
+    ("zoom", "Zoom"),
+    ("mdn web docs", "MDN"),
+    ("npm", "npm"),
+    ("crates.io", "crates.io"),
+    ("arch linux", "Arch Wiki"),
+    ("archwiki", "Arch Wiki"),
+]
+
+# Short site names that must match a whole trailing segment, never a substring,
+# or "X" would match any title containing the letter x.
+SHORT_SITES = {"x": "X", "hn": "Hacker News", "so": "Stack Overflow"}
+
+SEPARATORS = ["\u2014", "\u2013", "\u00b7", "|", " - ", ":: "]
+
+
+def emit(app: str, detail: str = "", kind: str = "") -> None:
+    json.dump({"app": app, "detail": detail, "kind": kind}, sys.stdout,
+              separators=(",", ":"))
+    sys.stdout.write("\n")
+
+
+def clean(value: str, allow_short: bool = False) -> str:
+    """Detail is a store key and a UI label: no separators, no newlines.
+
+    A one-character label from a bare title is noise, not information: a window
+    briefly titled "a" would otherwise earn its own permanent row. Names that
+    came out of a real path are exempt, since a directory called "b" is a
+    legitimate answer.
+    """
+    text = re.sub(r"\s+", " ", str(value or "")).strip()
+    text = text.replace("/", " ").replace("\x00", "").strip()
+    if not allow_short and len(text) < 2 and text != "~":
+        return ""
+    if len(text) > MAX_DETAIL:
+        text = text[:MAX_DETAIL - 1].rstrip() + "\u2026"
+    return text
+
+
+def split_segments(title: str) -> list:
+    """Break a title on any of the usual separators."""
+    parts = [title]
+    for sep in SEPARATORS:
+        nxt = []
+        for chunk in parts:
+            nxt.extend(chunk.split(sep))
+        parts = nxt
+    return [p.strip() for p in parts if p.strip()]
+
+
+# ------------------------------------------------------------------ terminals
+
+
+PATH_RE = re.compile(r"^(~|/|\.\./|\./|\u2026)")
+
+
+def basename_of(text: str) -> str:
+    """Last component of a path, tolerating the ellipsis terminals prepend."""
+    trimmed = str(text or "").rstrip("/")
+    if trimmed in ("~", "\u2026", ""):
+        return "~"
+    tail = trimmed.split("/")[-1]
+    return clean(tail or trimmed, allow_short=True)
+
+
+def looks_like_path(text: str) -> bool:
+    """A single token with a slash in it is a path, however it starts.
+
+    Terminals elide long directories down to "…/temp/ComfyUI/workflows", which
+    has no recognisable prefix but is still very much a path.
+    """
+    token = str(text or "").strip()
+    if not token or " " in token:
+        return False
+    return "/" in token or bool(PATH_RE.match(token))
+
+
+def terminal_detail(title: str) -> str:
+    """The program running in the terminal, or the directory it sits in."""
+    text = str(title or "").strip()
+    if not text:
+        return ""
+
+    # A path means an idle shell; the directory is the useful answer.
+    if looks_like_path(text):
+        return basename_of(text)
+
+    # "Some long session name - grok" -> the trailing segment is the program.
+    segments = split_segments(text)
+    if len(segments) > 1:
+        candidate = segments[-1]
+        # Guard against a title that merely contains a dash mid-sentence.
+        if len(candidate) <= 24 and " " not in candidate.strip():
+            return basename_of(candidate) if "/" in candidate else clean(candidate)
+
+    # A bare command line: the first token is the command. Bounded to a short,
+    # few-word title so that a sentence does not donate its first word — "some
+    # notes about things" must not become a program called "some".
+    words = text.split()
+    if words and len(text) <= 60 and len(words) <= 3:
+        first = words[0]
+        if looks_like_path(first):
+            return basename_of(first)
+        return clean(first)
+    return ""
+
+
+def is_uninformative(title: str, app_id: str) -> bool:
+    """A title that just restates the app tells us nothing.
+
+    Substring either way, not equality: Omarchy's floating terminal has class
+    "org.omarchy.terminal" and titles itself "Omarchy", which would otherwise
+    become a row called "Omarchy" sitting inside Omarchy.
+    """
+    text = re.sub(r"[^a-z0-9]", "", str(title or "").lower())
+    app = re.sub(r"[^a-z0-9]", "", str(app_id or "").lower())
+    if not text:
+        return True
+    if text in ("shell", "terminal", "console"):
+        return True
+    if not app:
+        return False
+    return text in app or app in text
+
+
+# -------------------------------------------------------------------- browsers
+
+
+def strip_browser_suffix(title: str) -> str:
+    text = str(title or "").strip()
+    lowered = text.lower()
+    for name in BROWSER_SUFFIXES:
+        for sep in ("\u2014 ", "\u2013 ", "- ", "\u00b7 ", "| "):
+            tail = sep + name
+            if lowered.endswith(tail):
+                return text[: len(text) - len(tail)].strip(" -\u2014\u2013\u00b7|")
+    return text
+
+
+def browser_detail(title: str) -> str:
+    """The site, taken from the end of the title. Never the page title."""
+    text = strip_browser_suffix(title)
+    if not text:
+        return ""
+    segments = split_segments(text)
+
+    # A trailing segment that names a known site is the most reliable signal.
+    if segments:
+        last = segments[-1].strip()
+        key = last.lower().strip(" .")
+        if key in SHORT_SITES:
+            return SHORT_SITES[key]
+        for needle, display in SITES:
+            if key == needle:
+                return display
+
+    # A site marker anywhere in the title is the next best thing. GitHub is the
+    # reason this exists: its titles are "owner/repo: description" with no
+    # trailing site segment at all.
+    lowered = text.lower()
+    best = ""
+    best_len = 0
+    for needle, display in SITES:
+        if needle in lowered and len(needle) > best_len:
+            best, best_len = display, len(needle)
+    if best:
+        return best
+
+    # Web apps title themselves "<document> - <App>", so an unrecognised
+    # trailing segment is usually still the site: "*Unsaved Workflow - ComfyUI"
+    # is ComfyUI. Bounded to a short, few-word fragment so that an article
+    # headline ending in a dash does not end up on disk as a "site".
+    if len(segments) > 1:
+        last = segments[-1].strip(" .")
+        if last and len(last) <= 24 and len(last.split()) <= 3:
+            return clean(last)
+
+    # Unrecognised: count it as plain browser time rather than inventing a
+    # label per page, which would bloat the store and leak what was read.
+    return ""
+
+
+# --------------------------------------------------------------- process tree
+
+
+def read_stat(pid: int):
+    """(comm, pgrp, tpgid) from /proc/<pid>/stat, tolerating spaces in comm."""
+    try:
+        with open(f"/proc/{pid}/stat", "r", encoding="utf-8", errors="replace") as fh:
+            raw = fh.read()
+    except OSError:
+        return None
+    close = raw.rfind(")")
+    open_paren = raw.find("(")
+    if close < 0 or open_paren < 0 or close < open_paren:
+        return None
+    comm = raw[open_paren + 1:close]
+    rest = raw[close + 2:].split()
+    if len(rest) < 6:
+        return None
+    try:
+        return comm, int(rest[2]), int(rest[5])
+    except ValueError:
+        return None
+
+
+def children_of(pid: int) -> list:
+    out = []
+    try:
+        tasks = os.listdir(f"/proc/{pid}/task")
+    except OSError:
+        return out
+    for tid in tasks:
+        try:
+            with open(f"/proc/{pid}/task/{tid}/children", "r", encoding="utf-8") as fh:
+                out.extend(int(p) for p in fh.read().split())
+        except (OSError, ValueError):
+            continue
+    return out
+
+
+def descendants(pid: int, limit: int = 200) -> list:
+    seen = []
+    queue = [pid]
+    visited = {pid}
+    while queue and len(seen) < limit:
+        current = queue.pop(0)
+        for child in children_of(current):
+            if child in visited:
+                continue
+            visited.add(child)
+            seen.append(child)
+            queue.append(child)
+    return seen
+
+
+def cmdline_name(pid: int) -> str:
+    """Unwrap `node /path/to/opencode` into `opencode`."""
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as fh:
+            parts = [p.decode("utf-8", "replace") for p in fh.read().split(b"\x00") if p]
+    except OSError:
+        return ""
+    if not parts:
+        return ""
+    for token in parts[1:]:
+        if token.startswith("-"):
+            continue
+        base = os.path.basename(token.rstrip("/"))
+        if not base:
+            continue
+        stem = re.sub(r"\.(js|mjs|cjs|py|rb|sh|ts)$", "", base)
+        if stem and stem.lower() not in WRAPPERS and not stem.startswith("-"):
+            return stem
+    return os.path.basename(parts[0])
+
+
+def cwd_name(pid: int) -> str:
+    try:
+        target = os.readlink(f"/proc/{pid}/cwd")
+    except OSError:
+        return ""
+    home = os.path.expanduser("~")
+    if target == home:
+        return "~"
+    return os.path.basename(target.rstrip("/")) or target
+
+
+def process_detail(pid: int) -> str:
+    """Unambiguous foreground command under `pid`, or "" if we cannot tell."""
+    if not pid:
+        return ""
+    commands = set()
+    shells = set()
+    for child in descendants(pid):
+        stat = read_stat(child)
+        if not stat:
+            continue
+        comm, pgrp, tpgid = stat
+        # Only the foreground process group of a terminal is what you see.
+        if tpgid <= 0 or pgrp != tpgid:
+            continue
+        name = comm.strip().lower()
+        if name in SHELLS:
+            directory = cwd_name(child)
+            if directory:
+                shells.add(directory)
+            continue
+        if name in WRAPPERS:
+            unwrapped = cmdline_name(child)
+            if unwrapped:
+                commands.add(unwrapped)
+                continue
+        commands.add(comm.strip())
+
+    # Several windows behind one pid: refuse to guess which one is focused.
+    if len(commands) == 1:
+        return clean(next(iter(commands)))
+    if not commands and len(shells) == 1:
+        return clean(next(iter(shells)))
+    return ""
+
+
+def pid_for_window(app_id: str, title: str) -> int:
+    """Ask Hyprland which pid owns the window we were handed."""
+    signature = os.environ.get("HYPRLAND_INSTANCE_SIGNATURE")
+    if not signature:
+        return 0
+    runtime = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
+    path = os.path.join(runtime, "hypr", signature, ".socket.sock")
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+            sock.settimeout(0.8)
+            sock.connect(path)
+            sock.sendall(b"j/clients")
+            chunks = []
+            while True:
+                block = sock.recv(65536)
+                if not block:
+                    break
+                chunks.append(block)
+        clients = json.loads(b"".join(chunks).decode("utf-8", "replace"))
+    except (OSError, ValueError):
+        return 0
+    if not isinstance(clients, list):
+        return 0
+    for client in clients:
+        if not isinstance(client, dict):
+            continue
+        if client.get("class") == app_id and client.get("title") == title:
+            try:
+                return int(client.get("pid") or 0)
+            except (TypeError, ValueError):
+                return 0
+    return 0
+
+
+# ------------------------------------------------------------------- dispatch
+
+
+def resolve(app_id: str, title: str, mode: str = "full") -> tuple:
+    app = str(app_id or "").strip()
+    key = app.lower()
+
+    if key in TERMINALS:
+        if mode == "off":
+            return "", ""
+        # A title that just repeats the app name is worse than nothing: it
+        # would show up as a row called "com.mitchellh.ghostty" inside Ghostty.
+        # Drop it and ask the process tree instead.
+        if is_uninformative(title, app):
+            detail = process_detail(pid_for_window(app, title))
+        else:
+            detail = terminal_detail(title)
+            if not detail:
+                detail = process_detail(pid_for_window(app, title))
+        return detail, "terminal" if detail else ""
+
+    if key in BROWSERS:
+        if mode != "full":
+            return "", ""
+        detail = browser_detail(title)
+        return detail, "site" if detail else ""
+
+    return "", ""
+
+
+def main(argv: list) -> int:
+    app = argv[0] if len(argv) > 0 else ""
+    title = argv[1] if len(argv) > 1 else ""
+    mode = argv[2] if len(argv) > 2 else "full"
+    try:
+        detail, kind = resolve(app, title, mode)
+    except Exception:
+        detail, kind = "", ""
+    emit(app, detail, kind)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

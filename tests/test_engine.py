@@ -489,6 +489,230 @@ class TestStoreLocation(StoreTestCase):
         self.assertTrue(os.path.isfile(engine.store_path()))
 
 
+class TestCompositeKeys(StoreTestCase):
+    def test_split_key(self):
+        self.assertEqual(engine.split_key("firefox"), ("firefox", ""))
+        self.assertEqual(engine.split_key("com.mitchellh.ghostty/opencode"),
+                         ("com.mitchellh.ghostty", "opencode"))
+        self.assertEqual(engine.split_key("helium/YouTube"), ("helium", "YouTube"))
+        # Only the first slash is the boundary.
+        self.assertEqual(engine.split_key("helium/a/b"), ("helium", "a/b"))
+        self.assertEqual(engine.split_key(""), ("", ""))
+
+    def test_app_list_puts_the_detail_first_and_the_host_second(self):
+        rows = engine.app_list({"com.mitchellh.ghostty/opencode": 1200}, 1200)
+        self.assertEqual(rows[0]["name"], "opencode")
+        self.assertEqual(rows[0]["host"], "Ghostty")
+        self.assertEqual(rows[0]["detail"], "opencode")
+        self.assertEqual(rows[0]["app"], "com.mitchellh.ghostty")
+        self.assertEqual(rows[0]["label"], "20m")
+
+    def test_app_list_without_detail_has_no_host(self):
+        rows = engine.app_list({"firefox": 600}, 600)
+        self.assertEqual(rows[0]["name"], "Firefox")
+        self.assertEqual(rows[0]["host"], "")
+        self.assertEqual(rows[0]["detail"], "")
+
+    def test_merge_by_app_rolls_detail_back_up(self):
+        apps = {
+            "com.mitchellh.ghostty/opencode": 1200,
+            "com.mitchellh.ghostty/claude": 600,
+            "helium/YouTube": 5400,
+            "helium/GitHub": 300,
+            "org.gnome.Nautilus": 60,
+        }
+        self.assertEqual(engine.merge_by_app(apps), {
+            "com.mitchellh.ghostty": 1800,
+            "helium": 5700,
+            "org.gnome.Nautilus": 60,
+        })
+
+    def test_merge_by_app_is_lossless(self):
+        apps = {"a/x": 10, "a/y": 20, "b": 30}
+        self.assertEqual(sum(engine.merge_by_app(apps).values()), 60)
+
+    def test_shares_are_computed_against_the_day_total(self):
+        rows = engine.app_list({"helium/YouTube": 5400, "helium/GitHub": 1800}, 7200)
+        self.assertAlmostEqual(rows[0]["share"], 0.75, places=3)
+        self.assertAlmostEqual(rows[1]["share"], 0.25, places=3)
+
+    def test_commit_accepts_composite_keys(self):
+        store = {"version": 1, "days": {}}
+        added = engine.merge_commit(store, {"days": {"2026-08-24": {
+            "com.mitchellh.ghostty/opencode": 1200,
+            "helium/YouTube": 5400,
+        }}})
+        self.assertEqual(added, 6600)
+        self.assertEqual(store["days"]["2026-08-24"]["total"], 6600)
+        self.assertIn("helium/YouTube", store["days"]["2026-08-24"]["apps"])
+
+    def test_snapshot_exposes_both_readings(self):
+        store = self.store_with({"2026-08-24": {
+            "com.mitchellh.ghostty/opencode": 1200,
+            "com.mitchellh.ghostty/claude": 600,
+            "helium/YouTube": 5400,
+        }})
+        snap = engine.build_snapshot(store, 6, True, None, self.today, None, 6, 0)
+        detailed = {r["name"]: r["seconds"] for r in snap["todayApps"]}
+        self.assertEqual(detailed["YouTube"], 5400)
+        self.assertEqual(detailed["opencode"], 1200)
+        self.assertEqual(detailed["claude"], 600)
+        grouped = {r["name"]: r["seconds"] for r in snap["todayByApp"]}
+        self.assertEqual(grouped["Ghostty"], 1800)
+        self.assertEqual(grouped["Helium"], 5400)
+        # Both views must add up to the same day total.
+        self.assertEqual(sum(r["seconds"] for r in snap["todayApps"]),
+                         sum(r["seconds"] for r in snap["todayByApp"]))
+
+    def test_selected_day_also_has_both_readings(self):
+        store = self.store_with({"2026-08-20": {"helium/YouTube": 3600}})
+        snap = engine.build_snapshot(store, 6, True, None, self.today,
+                                     "2026-08-20", 6, 0)
+        self.assertEqual(snap["selectedApps"][0]["name"], "YouTube")
+        self.assertEqual(snap["selectedByApp"][0]["name"], "Helium")
+
+    def test_daily_totals_are_unaffected_by_detail(self):
+        store = self.store_with({"2026-08-24": {"a/x": 100, "a/y": 200}})
+        snap = engine.build_snapshot(store, 6, True, None, self.today, None, 6, 0)
+        self.assertEqual(snap["todayTotal"], 300)
+        cell = next(d for w in snap["weeks"] for d in w["days"]
+                    if d["date"] == "2026-08-24")
+        self.assertEqual(cell["seconds"], 300)
+
+
+class TestAppTree(StoreTestCase):
+    APPS = {
+        "com.mitchellh.ghostty/opencode": 1200,
+        "com.mitchellh.ghostty/claude": 600,
+        "com.mitchellh.ghostty": 200,
+        "helium/YouTube": 5400,
+        "org.gnome.Nautilus": 60,
+    }
+    TOTAL = 7460
+
+    def tree(self, apps=None, total=None, limit=0):
+        return engine.app_tree(
+            self.APPS if apps is None else apps,
+            self.TOTAL if total is None else total,
+            limit,
+        )
+
+    def test_one_node_per_app_sorted_by_size(self):
+        names = [n["name"] for n in self.tree()]
+        self.assertEqual(names, ["Helium", "Ghostty", "Files"])
+
+    def test_detail_becomes_children(self):
+        ghostty = next(n for n in self.tree() if n["name"] == "Ghostty")
+        self.assertEqual([c["name"] for c in ghostty["children"]],
+                         ["opencode", "claude", "other"])
+        self.assertEqual(ghostty["seconds"], 2000)
+
+    def test_an_app_with_no_detail_is_a_leaf(self):
+        files = next(n for n in self.tree() if n["name"] == "Files")
+        self.assertEqual(files["children"], [])
+
+    def test_plain_time_alongside_detail_becomes_an_other_child(self):
+        ghostty = next(n for n in self.tree() if n["name"] == "Ghostty")
+        other = next(c for c in ghostty["children"] if c["name"] == "other")
+        self.assertEqual(other["seconds"], 200)
+
+    def test_no_other_child_when_detail_accounts_for_everything(self):
+        tree = self.tree({"helium/YouTube": 600}, 600)
+        self.assertEqual([c["name"] for c in tree[0]["children"]], ["YouTube"])
+
+    def test_no_other_child_for_a_leaf_app(self):
+        tree = self.tree({"firefox": 600}, 600)
+        self.assertEqual(tree[0]["children"], [])
+
+    def test_children_always_account_for_their_parent(self):
+        for node in self.tree():
+            if node["children"]:
+                self.assertEqual(sum(c["seconds"] for c in node["children"]),
+                                 node["seconds"], node["name"])
+
+    def test_the_tree_accounts_for_the_whole_day(self):
+        self.assertEqual(sum(n["seconds"] for n in self.tree()), self.TOTAL)
+
+    def test_shares_are_against_the_day_so_children_nest_visually(self):
+        ghostty = next(n for n in self.tree() if n["name"] == "Ghostty")
+        self.assertAlmostEqual(ghostty["share"], 2000 / self.TOTAL, places=3)
+        opencode = ghostty["children"][0]
+        self.assertAlmostEqual(opencode["share"], 1200 / self.TOTAL, places=3)
+        # parentShare is the slice of the folder, for reference.
+        self.assertAlmostEqual(opencode["parentShare"], 1200 / 2000, places=3)
+        self.assertLess(opencode["share"], ghostty["share"])
+
+    def test_child_ids_are_the_store_keys(self):
+        ghostty = next(n for n in self.tree() if n["name"] == "Ghostty")
+        self.assertEqual(ghostty["id"], "com.mitchellh.ghostty")
+        self.assertEqual(ghostty["children"][0]["id"],
+                         "com.mitchellh.ghostty/opencode")
+
+    def test_children_carry_their_host_for_display(self):
+        ghostty = next(n for n in self.tree() if n["name"] == "Ghostty")
+        self.assertEqual(ghostty["children"][0]["host"], "Ghostty")
+
+    def test_limit_truncates_folders_not_children(self):
+        tree = self.tree(limit=1)
+        self.assertEqual(len(tree), 1)
+        self.assertEqual(tree[0]["name"], "Helium")
+
+    def test_empty_input(self):
+        self.assertEqual(engine.app_tree({}, 0), [])
+
+    def test_zero_total_does_not_divide_by_zero(self):
+        tree = engine.app_tree({"a/x": 10}, 0)
+        self.assertTrue(tree[0]["share"] >= 0)
+
+    def test_snapshot_exposes_the_tree(self):
+        store = self.store_with({"2026-08-24": dict(self.APPS)})
+        snap = engine.build_snapshot(store, 6, True, None, self.today, None, 6, 0)
+        self.assertEqual(sum(n["seconds"] for n in snap["todayTree"]),
+                         snap["todayTotal"])
+        helium = next(n for n in snap["todayTree"] if n["name"] == "Helium")
+        self.assertEqual(helium["children"][0]["name"], "YouTube")
+
+    def test_selected_day_exposes_its_own_tree(self):
+        store = self.store_with({"2026-08-20": {"helium/YouTube": 3600}})
+        snap = engine.build_snapshot(store, 6, True, None, self.today,
+                                     "2026-08-20", 6, 0)
+        self.assertEqual(snap["selectedTree"][0]["name"], "Helium")
+        self.assertEqual(snap["selectedTree"][0]["children"][0]["name"], "YouTube")
+
+
+class TestSnapshotContract(StoreTestCase):
+    """The JS side asserts it preserves every field listed in the fixture.
+
+    This asserts the fixture still matches what the engine actually emits, so
+    adding a field here without regenerating the fixture fails loudly instead of
+    the field being silently dropped on its way to the panel.
+    """
+
+    FIXTURE = os.path.join(HERE, "fixtures", "snapshot-keys.json")
+
+    def test_fixture_matches_the_engine_output(self):
+        store = self.store_with({
+            self.today.isoformat(): {"com.mitchellh.ghostty/opencode": 60},
+        })
+        snap = engine.build_snapshot(store, 6, True, None, self.today,
+                                     self.today.isoformat(), 6, 0)
+        with open(self.FIXTURE, "r", encoding="utf-8") as handle:
+            recorded = set(json.load(handle))
+        actual = set(snap.keys())
+        missing = sorted(actual - recorded)
+        stale = sorted(recorded - actual)
+        self.assertEqual(missing, [], f"regenerate {self.FIXTURE}: new keys {missing}")
+        self.assertEqual(stale, [], f"regenerate {self.FIXTURE}: removed keys {stale}")
+
+    def test_commit_adds_only_the_committed_key(self):
+        store = {"version": 1, "days": {}}
+        snap = engine.build_snapshot(store, 6, True, None, self.today, None, 6, 0)
+        snap["committed"] = 0
+        with open(self.FIXTURE, "r", encoding="utf-8") as handle:
+            recorded = set(json.load(handle))
+        self.assertEqual(set(snap.keys()) - recorded, {"committed"})
+
+
 class TestCli(StoreTestCase):
     def run_cli(self, argv):
         # The CLI prints to stdout by design; swallow it so the test log stays

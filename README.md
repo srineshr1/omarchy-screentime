@@ -42,6 +42,8 @@ urgent colour instead of getting "greener". More is not better here.
 | **Shaded against a limit** | Intensity is a share of your daily limit, and over-limit days go urgent-red. Optional `traffic` palette ramps green → amber → red. |
 | **Click any day** | Opens that day's per-app breakdown. Click again, or press `t`, to go back to today. |
 | **Per-app breakdown** | Today's apps with share bars, resolved to real names from `.desktop` entries (`com.mitchellh.ghostty` → Ghostty). |
+| **What you were actually doing** | A terminal reports the program running in it, not the terminal: `opencode 20m`, `claude 14m`, `nvim 8m`, or the working directory when a shell is idle. Browsers report the site: `YouTube 1h 30m`. |
+| **Openable folders** | The breakdown is a tree. Each app is a folder you click open to see what ran inside it — `Ghostty` → `grok`, `kiro-cli`, `workflows`. Unresolved time inside a folder shows as `other`, so the children always add up to the parent. |
 | **Limit tracking** | A progress bar toward the limit, time left, and a streak of consecutive days under it. |
 | **Last 7 days** | Clickable bars, today emphasised, zero days shown as a faint rule rather than a stub. |
 | **Idle-aware** | The clock stops after `idleTimeoutSec` with no input, and when no window has focus. A bare desktop is not usage. |
@@ -73,6 +75,7 @@ already ships. A Nerd Font provides the glyph.
 | Click a box | Show that day's per-app breakdown |
 | `t` | Back to today |
 | `a` | Expand / collapse the full app list |
+| `g` | Open / close every app folder |
 | `[` `]` | Move the window one month back / forward |
 | `r` | Refresh |
 | `Esc` | Close |
@@ -95,6 +98,7 @@ Configurable from _Setup > Plugins_, or inline on the widget's entry in
 | `idleTimeoutSec` | `120` | No input for this long stops the clock. |
 | `barMode` | `strip` | `strip` (boxes + time), `total` (time only), `icon` (glyph only). |
 | `gridPalette` | `accent` | `accent` for GitHub's single hue, `traffic` for green → amber → red. |
+| `detailLevel` | `full` | `off` for app names only, `terminal` to also record what runs in terminals, `full` to also record which site a browser is on. |
 | `weekStartsMonday` | `true` | Set `false` for Sunday-first rows, like GitHub. |
 | `ignoredApps` | `""` | Extra app ids never to count, comma-separated. A trailing `*` matches a prefix (`steam_app_*`). Screensaver and lock screens are always ignored. |
 | `detailRetentionDays` | `120` | How long per-app detail is kept. Daily totals are kept forever. |
@@ -117,6 +121,45 @@ costs at most one 60-second batch and can never leave a torn store.
 Known limit: idle is detected by timeout, so up to `idleTimeoutSec` of the
 period after you walk away is still counted. Lower it if that bothers you.
 
+## What you were actually doing
+
+"Ghostty 4h" is not a useful sentence. `bin/resolve-focus` turns the focused
+window into the thing you care about, using the window title first:
+
+| Title | Row |
+| --- | --- |
+| `opencode` | `opencode` |
+| `Refactor the tracker - claude` | `claude` |
+| `~/Projects/Screentime` | `Screentime` |
+| `…/temp/ComfyUI/workflows` | `workflows` |
+| `Never Gonna Give You Up - YouTube - Helium` | `YouTube` |
+| `*Unsaved Workflow - ComfyUI - Helium` | `ComfyUI` |
+
+Terminals put the running program or the working directory in their title, and
+browsers put the page title there. The title is the primary signal because it
+is the only one that survives a terminal that keeps every window in one
+process: Ghostty runs all of its windows under a single pid, so walking that
+pid's children cannot tell one window from another.
+
+When a terminal's title is uninformative — a bare `foot`, or Omarchy's floating
+terminal calling itself `Omarchy` — the resolver falls back to the process tree,
+picking the foreground process group under the window's pid. If several windows
+share that pid and disagree, it reports nothing rather than guessing.
+
+Two things it deliberately does not do:
+
+- **The page title never reaches disk.** Only the trailing site segment is kept,
+  so `how to treat a rash - Google Search` is stored as `Google Search` and a
+  video is stored as `YouTube`. What you searched for or watched is dropped.
+- **Unrecognised pages get no label.** A page with no site segment is counted as
+  plain browser time instead of creating one row per page, which would both
+  bloat the store and record what you were reading.
+
+Set `detailLevel` to `terminal` to keep terminal detail but stop looking at
+browser titles, or `off` to record nothing but app names.
+
+Detail is stored as `appId/detail`, so the daily totals the heatmap draws are
+unchanged by it, and `g` in the panel rolls detail back up into per-app totals.
 ## Data
 
 One file:
@@ -131,15 +174,21 @@ $XDG_DATA_HOME/omarchy-screentime/history.json
   "days": {
     "2026-08-24": {
       "total": 16200,
-      "apps": { "com.mitchellh.ghostty": 9000, "firefox": 7200 }
+      "apps": {
+        "com.mitchellh.ghostty/opencode": 7200,
+        "com.mitchellh.ghostty/claude": 1800,
+        "helium/YouTube": 5400,
+        "org.gnome.Nautilus": 1800
+      }
     }
   }
 }
 ```
 
-Integers, seconds. `total` is authoritative and survives pruning, so a day
-whose per-app detail has aged out still reports its total. `screentime path`
-prints the location; delete the file to reset everything.
+Integers, seconds. A key is `appId` or `appId/detail`, split on the first slash.
+`total` is authoritative and survives pruning, so a day whose per-app detail has
+aged out still reports its total. `screentime path` prints the location; delete
+the file to reset everything.
 
 Not under `$XDG_DATA_HOME/omarchy/` on purpose: on a real install that is a
 symlink to the root-owned `/usr/share/omarchy`.
@@ -150,6 +199,7 @@ The same engine the widget uses, from a terminal:
 
 ```bash
 screentime today          # today's total and per-app breakdown
+screentime --group today   # the same, rolled up per app
 screentime week           # last 7 days as bars
 screentime year [YYYY]    # ASCII contribution heatmap
 screentime json           # raw store

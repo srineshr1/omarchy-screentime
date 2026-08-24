@@ -1,4 +1,5 @@
 import assert from "node:assert/strict"
+import { readFileSync } from "node:fs"
 import { test } from "node:test"
 import { loadQmlJs } from "./harness.mjs"
 
@@ -272,6 +273,56 @@ test("isToday compares against a supplied clock", () => {
   assert.equal(Model.isToday("2026-08-24", now), true)
   assert.equal(Model.isToday("2026-08-23", now), false)
   assert.equal(Model.isToday("", now), false)
+})
+
+test("parseSnapshot keeps every field the engine sends", () => {
+  // Regression: parseSnapshot used to iterate emptySnapshot()'s keys, so any
+  // field added to bin/screentime but not mirrored in Model.js was silently
+  // dropped. todayTree went missing that way and the breakdown rendered
+  // "Nothing recorded yet today" next to a non-zero total.
+  const engineKeys = JSON.parse(
+    readFileSync(new URL("./fixtures/snapshot-keys.json", import.meta.url), "utf8"))
+  const payload = { ok: true }
+  for (const key of engineKeys) {
+    if (key !== "ok") payload[key] = "sentinel:" + key
+  }
+  const parsed = Model.parseSnapshot(JSON.stringify(payload))
+  for (const key of engineKeys) {
+    assert.ok(key in parsed, `parseSnapshot dropped ${key}`)
+    if (key !== "ok" && key !== "error") {
+      assert.equal(parsed[key], "sentinel:" + key, `parseSnapshot mangled ${key}`)
+    }
+  }
+})
+
+test("emptySnapshot declares a default for every field the engine sends", () => {
+  // Not strictly required now that parseSnapshot passes unknown keys through,
+  // but a missing default means the panel reads undefined before the first
+  // snapshot arrives.
+  const engineKeys = JSON.parse(
+    readFileSync(new URL("./fixtures/snapshot-keys.json", import.meta.url), "utf8"))
+  const empty = Model.emptySnapshot()
+  const missing = engineKeys.filter((key) => !(key in empty) && key !== "generatedAt")
+  assert.deepEqual(missing, [], `emptySnapshot is missing: ${missing.join(", ")}`)
+})
+
+test("the tree fields survive parsing and default to empty arrays", () => {
+  const empty = Model.emptySnapshot()
+  assert.deepEqual(empty.todayTree, [])
+  assert.deepEqual(empty.selectedTree, [])
+
+  const parsed = Model.parseSnapshot(JSON.stringify({
+    ok: true,
+    todayTree: [{
+      id: "com.mitchellh.ghostty",
+      name: "Ghostty",
+      label: "30m",
+      share: 0.5,
+      children: [{ id: "com.mitchellh.ghostty/opencode", name: "opencode", label: "20m" }]
+    }]
+  }))
+  assert.equal(parsed.todayTree.length, 1)
+  assert.equal(parsed.todayTree[0].children[0].name, "opencode")
 })
 
 test("emptySnapshot is a complete, safe shape", () => {

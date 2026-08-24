@@ -247,6 +247,20 @@ def format_duration(seconds: int) -> str:
     return f"{seconds}s" if seconds else "0m"
 
 
+def split_key(key: str) -> tuple:
+    """Store keys are "appId" or "appId/detail".
+
+    App ids never contain a slash (the tracker strips paths from them) and
+    detail is sanitised the same way, so the first slash is an unambiguous
+    boundary.
+    """
+    raw = str(key or "")
+    if "/" not in raw:
+        return raw, ""
+    app, detail = raw.split("/", 1)
+    return app, detail.strip()
+
+
 def pretty_name(app_id: str) -> str:
     """A human name for an appId, without ever failing."""
     raw = str(app_id or "").strip()
@@ -400,20 +414,101 @@ def apps_for(store: dict, key: str) -> dict:
 
 
 def app_list(apps: dict, total: int, limit: int = 0) -> list:
+    """Rows for the UI.
+
+    A key of "com.mitchellh.ghostty/opencode" becomes name "opencode" with
+    host "Ghostty": what you were doing is the headline, the window it happened
+    in is the footnote.
+    """
     rows = sorted(apps.items(), key=lambda kv: (-kv[1], kv[0]))
     if limit > 0:
         rows = rows[:limit]
     denominator = max(1, total)
-    return [
-        {
-            "id": app,
-            "name": pretty_name(app),
+    out = []
+    for key, secs in rows:
+        app, detail = split_key(key)
+        host = pretty_name(app)
+        out.append({
+            "id": key,
+            "app": app,
+            "name": detail or host,
+            "detail": detail,
+            "host": host if detail else "",
             "seconds": secs,
             "share": round(secs / denominator, 4),
             "label": format_duration(secs),
-        }
-        for app, secs in rows
-    ]
+        })
+    return out
+
+
+def merge_by_app(apps: dict) -> dict:
+    """Collapse detail back into per-app totals."""
+    out: dict = {}
+    for key, secs in apps.items():
+        app, _ = split_key(key)
+        out[app] = out.get(app, 0) + to_int(secs)
+    return out
+
+
+def app_tree(apps: dict, total: int, limit: int = 0) -> list:
+    """The breakdown as folders: one node per app, detail as its children.
+
+    Ghostty is the folder, `grok` and `claude` are what is inside it. An app
+    with no resolved detail is a leaf. Shares are all against the day total so
+    a child's bar reads as a slice of its parent's bar.
+
+    When an app has both resolved detail and plain time — time from before
+    detail existed, or a window whose title said nothing — the leftover is
+    emitted as an "other" child so the children always account for the parent.
+    """
+    grouped: dict = {}
+    for key, secs in apps.items():
+        app, detail = split_key(key)
+        node = grouped.setdefault(app, {"total": 0, "children": {}})
+        node["total"] += to_int(secs)
+        if detail:
+            node["children"][detail] = node["children"].get(detail, 0) + to_int(secs)
+
+    denominator = max(1, total)
+    rows = sorted(grouped.items(), key=lambda kv: (-kv[1]["total"], kv[0]))
+    if limit > 0:
+        rows = rows[:limit]
+
+    out = []
+    for app, node in rows:
+        children = list(node["children"].items())
+        remainder = node["total"] - sum(node["children"].values())
+        if children and remainder > 0:
+            children.append(("other", remainder))
+        # Sorted by size including "other": it is often the largest slice while
+        # older data ages out, and pinning it last would bury that.
+        children.sort(key=lambda kv: (-kv[1], kv[0]))
+        out.append({
+            "id": app,
+            "app": app,
+            "name": pretty_name(app),
+            "detail": "",
+            "host": "",
+            "seconds": node["total"],
+            "share": round(node["total"] / denominator, 4),
+            "label": format_duration(node["total"]),
+            "children": [
+                {
+                    "id": app + "/" + name,
+                    "app": app,
+                    "name": name,
+                    "detail": name,
+                    "host": pretty_name(app),
+                    "seconds": secs,
+                    "share": round(secs / denominator, 4),
+                    "parentShare": round(secs / max(1, node["total"]), 4),
+                    "label": format_duration(secs),
+                    "children": [],
+                }
+                for name, secs in children
+            ],
+        })
+    return out
 
 
 def build_grid(store: dict, first: date, last: date, goal_seconds: int,
@@ -568,6 +663,8 @@ def build_snapshot(store: dict, goal_hours: int, monday_first: bool, year: int |
         "todayLabel": format_duration(today_total),
         "todayLevel": level_for(today_total, goal_seconds),
         "todayApps": app_list(today_apps, today_total),
+        "todayByApp": app_list(merge_by_app(today_apps), today_total),
+        "todayTree": app_tree(today_apps, today_total),
         "yesterdayTotal": yesterday_total,
         "yesterdayLabel": format_duration(yesterday_total),
         "goalHours": max(1, to_int(goal_hours)),
@@ -607,6 +704,8 @@ def build_snapshot(store: dict, goal_hours: int, monday_first: bool, year: int |
         "selectedTotal": selected_total,
         "selectedLabel": format_duration(selected_total),
         "selectedApps": app_list(selected_apps, selected_total),
+        "selectedByApp": app_list(merge_by_app(selected_apps), selected_total),
+        "selectedTree": app_tree(selected_apps, selected_total),
         "selectedDetailExpired": bool(selected_key and selected_total > 0 and not selected_apps),
         "storePath": store_path(),
     }
@@ -650,14 +749,24 @@ def cmd_today(args) -> int:
     today = date.today()
     total = total_for(store, day_key(today))
     print(f"Screen time today: {format_duration(total)}")
-    rows = app_list(apps_for(store, day_key(today)), total, 10)
-    if not rows:
+    apps = apps_for(store, day_key(today))
+    if not apps:
         print("  no usage recorded yet")
         return 0
-    width = max(len(row["name"]) for row in rows)
-    for row in rows:
+
+    if args.group:
+        rows = [(row["name"], row) for row in app_list(merge_by_app(apps), total, 12)]
+    else:
+        rows = []
+        for node in app_tree(apps, total, 12):
+            rows.append((node["name"], node))
+            for child in node["children"]:
+                rows.append(("  \u2514 " + child["name"], child))
+
+    width = max(len(label) for label, _ in rows)
+    for label, row in rows:
         bar = "\u2588" * max(1, round(row["share"] * 24))
-        print(f"  {row['name']:<{width}}  {row['label']:>7}  {bar}")
+        print(f"  {label:<{width}}  {row['label']:>7}  {bar}")
     return 0
 
 
@@ -736,6 +845,8 @@ def build_parser() -> argparse.ArgumentParser:
                         help="months of history in the heatmap window (default 6)")
     parser.add_argument("--offset", type=int, default=0,
                         help="shift the heatmap window back by this many months")
+    parser.add_argument("--group", action="store_true",
+                        help="roll detail up into per-app totals")
     week = parser.add_mutually_exclusive_group()
     week.add_argument("--monday", dest="monday", action="store_true", default=True,
                       help="weeks start on Monday (default)")

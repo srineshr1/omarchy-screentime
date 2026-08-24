@@ -1,5 +1,4 @@
 import QtQuick
-import QtQuick.Controls
 import Quickshell
 import Quickshell.Io
 import qs.Commons
@@ -21,6 +20,10 @@ Panel {
   readonly property var barIdentity: hostWidget || root
 
   property bool showAllApps: false
+  // Which app folders are open, keyed by app id. Reassigned wholesale rather
+  // than mutated so the bindings that read it actually re-evaluate.
+  property var expandedApps: ({})
+  property bool expandAll: false
 
   readonly property color foreground: bar ? bar.foreground : Color.foreground
   readonly property color secondaryForeground: Qt.darker(foreground, 1.5)
@@ -34,14 +37,23 @@ Panel {
   readonly property bool viewingPast: selectedDay.length > 0 && selectedDay !== snapshot.today
 
   // The breakdown follows the selection: today by default, otherwise whichever
-  // heatmap box was clicked.
+  // heatmap box was clicked. One node per app, resolved detail as its children.
   readonly property var breakdownApps: {
-    if (root.viewingPast) return snapshot.selectedApps || []
-    return snapshot.todayApps || []
+    if (root.viewingPast) return snapshot.selectedTree || []
+    return snapshot.todayTree || []
   }
   readonly property var visibleApps: root.showAllApps
     ? (root.breakdownApps || [])
     : (root.breakdownApps || []).slice(0, 7)
+
+  // Whether anything can be opened at all; with detailLevel off, nothing can.
+  readonly property bool hasFolders: {
+    var list = root.breakdownApps || []
+    for (var i = 0; i < list.length; i++) {
+      if (list[i].children && list[i].children.length > 0) return true
+    }
+    return false
+  }
   readonly property int breakdownTotal: root.viewingPast
     ? Number(snapshot.selectedTotal) || 0
     : root.liveToday
@@ -102,6 +114,31 @@ Panel {
     if (service && service.selectedDay.length > 0) service.selectDay(service.selectedDay)
   }
 
+  function isExpanded(id) {
+    if (root.expandAll) return true
+    return root.expandedApps[String(id)] === true
+  }
+
+  function toggleApp(id) {
+    var key = String(id)
+    var next = {}
+    for (var existing in root.expandedApps) next[existing] = root.expandedApps[existing]
+    if (root.expandAll) {
+      // Collapsing one folder while everything is open: keep the rest open.
+      for (var i = 0; i < root.breakdownApps.length; i++)
+        next[String(root.breakdownApps[i].id)] = true
+      root.expandAll = false
+    }
+    if (next[key]) delete next[key]
+    else next[key] = true
+    root.expandedApps = next
+  }
+
+  function toggleExpandAll() {
+    root.expandAll = !root.expandAll
+    root.expandedApps = ({})
+  }
+
   function stepWindow(delta) {
     if (service) service.stepWindow(delta)
   }
@@ -135,6 +172,7 @@ Panel {
         if (text === "r" || text === "R") root.refresh()
         else if (text === "t" || text === "T") root.clearSelection()
         else if (text === "a" || text === "A") root.showAllApps = !root.showAllApps
+        else if (text === "g" || text === "G") root.toggleExpandAll()
         else if (text === "[") root.stepWindow(-1)
         else if (text === "]") root.stepWindow(1)
       }
@@ -148,7 +186,9 @@ Panel {
         boundsBehavior: Flickable.StopAtBounds
         flickableDirection: Flickable.VerticalFlick
         interactive: contentHeight > height
-        ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
+        // No ScrollBar attached on purpose: the panel still scrolls by wheel,
+        // drag and keyboard, but a visible bar overlaps the content in a
+        // surface this narrow.
 
         Column {
           id: column
@@ -168,11 +208,9 @@ Panel {
                 : Model.formatDuration(-remaining) + " over limit")
               return bits.join(" \u00b7 ")
             }
-            detail: {
-              var streak = Number(root.snapshot.streak) || 0
-              if (streak > 0) return streak + (streak === 1 ? " day" : " days") + " under limit"
-              return "Limit " + root.snapshot.goalHours + "h/day"
-            }
+            // No `detail` here on purpose: the badge it rendered sat next to
+            // the title and read as a notification. The streak moved to the
+            // footer line with the rest of the standing totals.
             foreground: root.foreground
             fontFamily: root.fontFamily
             iconComponent: Component {
@@ -254,6 +292,21 @@ Panel {
               }
 
               Text {
+                visible: root.hasFolders
+                text: root.expandAll ? "collapse" : "expand all"
+                anchors.verticalCenter: parent.verticalCenter
+                color: Color.accent
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+                MouseArea {
+                  anchors.fill: parent
+                  hoverEnabled: true
+                  cursorShape: Qt.PointingHandCursor
+                  onClicked: root.toggleExpandAll()
+                }
+              }
+
+              Text {
                 visible: root.viewingPast
                 anchors.verticalCenter: parent.verticalCenter
                 text: "back to today"
@@ -294,46 +347,44 @@ Panel {
             Repeater {
               model: root.visibleApps
 
-              Item {
+              // One app folder: its own row, then its children when open.
+              Column {
+                id: folder
                 required property var modelData
+                readonly property var kids: modelData.children || []
+                readonly property bool open: root.isExpanded(modelData.id)
                 width: parent.width
-                implicitHeight: appName.implicitHeight + Style.space(7)
+                spacing: Style.space(6)
 
-                Text {
-                  id: appName
-                  anchors.left: parent.left
-                  anchors.top: parent.top
-                  width: parent.width * 0.5
-                  text: Model.safeText(modelData.name, 42)
-                  textFormat: Text.PlainText
-                  color: root.foreground
-                  font.family: root.fontFamily
-                  font.pixelSize: Style.font.body
-                  elide: Text.ElideRight
+                UsageRow {
+                  width: folder.width
+                  row: folder.modelData
+                  expandable: folder.kids.length > 0
+                  expanded: folder.open
+                  foreground: root.foreground
+                  dim: root.secondaryForeground
+                  accent: Color.accent
+                  fontFamily: root.fontFamily
+                  onToggled: root.toggleApp(folder.modelData.id)
                 }
 
-                Text {
-                  anchors.right: parent.right
-                  anchors.top: parent.top
-                  text: modelData.label
-                  color: root.secondaryForeground
-                  font.family: root.fontFamily
-                  font.pixelSize: Style.font.body
-                }
+                Column {
+                  width: folder.width
+                  spacing: Style.space(6)
+                  visible: folder.open && folder.kids.length > 0
 
-                Rectangle {
-                  anchors.left: parent.left
-                  anchors.right: parent.right
-                  anchors.bottom: parent.bottom
-                  height: Style.space(3)
-                  radius: height / 2
-                  color: Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.12)
-
-                  Rectangle {
-                    width: parent.width * Math.max(0, Math.min(1, Number(modelData.share) || 0))
-                    height: parent.height
-                    radius: parent.radius
-                    color: Color.accent
+                  Repeater {
+                    model: folder.kids
+                    UsageRow {
+                      required property var modelData
+                      width: folder.width
+                      row: modelData
+                      child: true
+                      foreground: root.foreground
+                      dim: root.secondaryForeground
+                      accent: Color.accent
+                      fontFamily: root.fontFamily
+                    }
                   }
                 }
               }
@@ -581,6 +632,9 @@ Panel {
             width: parent.width
             text: {
               var bits = []
+              var streak = Number(root.snapshot.streak) || 0
+              if (streak > 0)
+                bits.push(streak + (streak === 1 ? " day" : " days") + " under limit")
               if (root.snapshot.daysTracked > 0)
                 bits.push(root.snapshot.daysTracked + " days tracked")
               if (root.snapshot.allTimeTotal > 0)

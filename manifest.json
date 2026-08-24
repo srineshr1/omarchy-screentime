@@ -24,6 +24,7 @@
       "barMode": "strip",
       "gridPalette": "accent",
       "historyMonths": 6,
+      "detailLevel": "full",
       "weekStartsMonday": true,
       "detailRetentionDays": 120,
       "ignoredApps": ""
@@ -80,6 +81,14 @@
         "type": "boolean",
         "label": "Start weeks on Monday",
         "defaultValue": true
+      },
+      {
+        "key": "detailLevel",
+        "type": "string",
+        "label": "What to record inside a window",
+        "description": "off = app names only. terminal = also the program or directory in terminals. full = also which site a browser is on (taken from the tab title, never the page you were reading).",
+        "options": ["off", "terminal", "full"],
+        "defaultValue": "full"
       },
       {
         "key": "ignoredApps",

@@ -32,12 +32,21 @@ Item {
 
   readonly property string pluginDir: Model.pluginFilePath(Qt.resolvedUrl("."))
   readonly property string helperPath: pluginDir + "/bin/screentime"
+  readonly property string resolverPath: pluginDir + "/bin/resolve-focus"
 
   readonly property int goalHours: Model.intSetting(setting("dailyGoalHours", 6), 6, 1, 24)
   readonly property int idleTimeoutSec: Model.intSetting(setting("idleTimeoutSec", 120), 120, 30, 1800)
   readonly property int retentionDays: Model.intSetting(setting("detailRetentionDays", 120), 120, 7, 3650)
   readonly property int historyMonths: Model.intSetting(setting("historyMonths", 6), 6, 1, 24)
   readonly property bool mondayFirst: setting("weekStartsMonday", true) !== false
+
+  // off = app names only, terminal = also what runs in terminals,
+  // full = also which site a browser is on.
+  readonly property string detailLevel: {
+    var value = String(setting("detailLevel", "full"))
+    if (value !== "off" && value !== "terminal" && value !== "full") return "full"
+    return value
+  }
 
   readonly property int sampleIntervalMs: 5000
   readonly property int commitIntervalMs: 60000
@@ -66,6 +75,29 @@ Item {
     if (!top) return ""
     return Tracker.normalizeAppId(top.appId)
   }
+  readonly property string currentTitle: {
+    var top = ToplevelManager.activeToplevel
+    if (!top) return ""
+    return String(top.title || "")
+  }
+
+  // What is actually happening inside the focused window: the program running
+  // in a terminal, or the site a browser is on. Resolved out of process.
+  property string currentDetail: ""
+  // The window the detail belongs to, so a late resolver reply cannot attach
+  // "opencode" to whatever happens to be focused by the time it lands.
+  property string detailForApp: ""
+  property string detailForTitle: ""
+
+  // The accounting key. Detail is appended after a slash; the engine splits it
+  // back apart for display and can roll it up into per-app totals.
+  readonly property string currentKey: {
+    if (currentAppId.length === 0) return ""
+    if (currentDetail.length === 0) return currentAppId
+    if (detailForApp !== currentAppId) return currentAppId
+    return currentAppId + "/" + currentDetail
+  }
+
   readonly property bool seatIdle: idleMonitor.isIdle === true
   // Extra app ids the user never wants counted, on top of the built-in
   // screensaver/lock surfaces.
@@ -88,7 +120,7 @@ Item {
   function observeNow() {
     trackerState = Tracker.observe(trackerState, {
       now: Date.now(),
-      appId: currentAppId,
+      appId: currentKey,
       active: shouldCount,
       intervalMs: sampleIntervalMs,
       maxStepMs: sampleIntervalMs * 4
@@ -96,15 +128,55 @@ Item {
     liveToday = Tracker.liveTotal(committedToday, trackerState, todayKey)
   }
 
-  // Focus and idle changes must close the open window immediately, otherwise
-  // up to one sample interval lands on the wrong app.
-  onCurrentAppIdChanged: observeNow()
+  // Focus, detail and idle changes must close the open window immediately,
+  // otherwise up to one sample interval lands on the wrong row.
+  onCurrentKeyChanged: observeNow()
   onSeatIdleChanged: {
     observeNow()
     // Coming back from idle: bank what we have so a crash later cannot lose
     // a whole session, and refresh so the panel is current when reopened.
     if (!seatIdle) Qt.callLater(commit)
   }
+
+  // ---- detail resolution -------------------------------------------------
+
+  function resolveDetail() {
+    if (detailLevel === "off") {
+      currentDetail = ""
+      return
+    }
+    if (currentAppId.length === 0) {
+      currentDetail = ""
+      return
+    }
+    if (resolveProc.running) {
+      _resolveQueued = true
+      return
+    }
+    _resolveApp = currentAppId
+    _resolveTitle = currentTitle
+    _resolveOut = ""
+    resolveProc.command = [resolverPath, _resolveApp, _resolveTitle, detailLevel]
+    resolveProc.running = true
+  }
+
+  // The title changes on every tab switch and every command a terminal runs,
+  // so resolution is debounced rather than fired on each keystroke of a title.
+  onCurrentTitleChanged: resolveDebounce.restart()
+  onCurrentAppIdChanged: {
+    // A new window: the old detail is definitely stale.
+    if (detailForApp !== currentAppId) currentDetail = ""
+    resolveDebounce.restart()
+  }
+  onDetailLevelChanged: {
+    currentDetail = ""
+    resolveDetail()
+  }
+
+  property string _resolveApp: ""
+  property string _resolveTitle: ""
+  property string _resolveOut: ""
+  property bool _resolveQueued: false
 
   function commit() {
     if (committing) {
@@ -224,6 +296,58 @@ Item {
     onTriggered: root.observeNow()
   }
 
+  // Debounce: a terminal running a command rewrites its title repeatedly, and
+  // each resolve is a process spawn.
+  Timer {
+    id: resolveDebounce
+    interval: 900
+    repeat: false
+    onTriggered: root.resolveDetail()
+  }
+
+  // A terminal can change what it is running without changing its title (a
+  // shell with no integration), so re-check periodically as well.
+  Timer {
+    id: resolvePoll
+    interval: 20000
+    running: root.detailLevel !== "off"
+    repeat: true
+    onTriggered: if (root.shouldCount) root.resolveDetail()
+  }
+
+  Process {
+    id: resolveProc
+    running: false
+    command: []
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root._resolveOut = text
+    }
+    stderr: StdioCollector { waitForEnd: true }
+    onExited: function (exitCode) {
+      var detail = ""
+      if (exitCode === 0) {
+        try {
+          var parsed = JSON.parse(String(root._resolveOut || "{}"))
+          if (parsed && parsed.app === root._resolveApp)
+            detail = Tracker.normalizeDetail(parsed.detail)
+        } catch (e) {
+          detail = ""
+        }
+      }
+      // Only adopt the answer if it still describes the focused window.
+      if (root._resolveApp === root.currentAppId) {
+        root.detailForApp = root._resolveApp
+        root.detailForTitle = root._resolveTitle
+        root.currentDetail = detail
+      }
+      if (root._resolveQueued) {
+        root._resolveQueued = false
+        Qt.callLater(root.resolveDetail)
+      }
+    }
+  }
+
   Timer {
     id: commitTimer
     interval: root.commitIntervalMs
@@ -313,6 +437,10 @@ Item {
         today: root.todayLabel,
         seconds: root.liveToday,
         app: root.currentAppId,
+        detail: root.currentDetail,
+        key: root.currentKey,
+        title: root.currentTitle,
+        detailLevel: root.detailLevel,
         counting: root.shouldCount,
         idle: root.seatIdle,
         ignored: root.appIgnored,
