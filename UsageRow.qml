@@ -3,7 +3,8 @@ import qs.Commons
 import qs.Ui
 import "lib/Model.js" as Model
 
-// One line of the breakdown: a name, a duration, and a share bar under both.
+// One line of the breakdown: a name, its data usage, a duration, and a share
+// bar under all three.
 //
 // A parent row is an app and behaves like a folder — a chevron on the left, the
 // whole row clickable to open it. A child row is what was running inside that
@@ -15,6 +16,9 @@ Item {
   property bool child: false
   property bool expandable: false
   property bool expanded: false
+  // Off until the store has some traffic in it, so a fresh install does not
+  // show an empty column.
+  property bool showNet: false
 
   property color foreground: Color.foreground
   property color dim: Qt.darker(Color.foreground, 1.5)
@@ -29,6 +33,7 @@ Item {
   // "other" is the plugin's own word for unresolved time, not an app name, so
   // it is set in the dim colour to read as a remainder rather than a program.
   readonly property bool remainder: child && String(row ? row.name : "") === "other"
+  readonly property string netText: Model.netLabel(row ? row.net : null, true)
 
   implicitHeight: label.implicitHeight + Style.space(8)
 
@@ -61,7 +66,9 @@ Item {
     id: label
     x: root.indent + (root.child ? 0 : root.chevronWidth)
     anchors.top: parent.top
-    width: Math.max(0, duration.x - x - Style.space(8))
+    // Yields to the data column when there is one, so a long app name elides
+    // instead of overprinting the numbers.
+    width: Math.max(0, (data.visible ? data.x : duration.x) - x - Style.space(8))
     text: Model.safeText(root.row ? root.row.name : "", 40)
     textFormat: Text.PlainText
     color: root.remainder
@@ -70,6 +77,22 @@ Item {
     font.family: root.fontFamily
     font.pixelSize: root.child ? Style.font.caption : Style.font.body
     elide: Text.ElideRight
+  }
+
+  // Down and up for this app. Blank rather than "D 0 B" when nothing was
+  // measured: detail rows inside a folder have no traffic of their own, and a
+  // confident zero there would be a lie.
+  Text {
+    id: data
+    anchors.right: duration.left
+    anchors.rightMargin: Style.space(10)
+    anchors.baseline: label.baseline
+    visible: root.showNet && root.netText.length > 0
+    text: root.netText
+    textFormat: Text.PlainText
+    color: root.dim
+    font.family: root.fontFamily
+    font.pixelSize: Style.font.caption
   }
 
   Text {

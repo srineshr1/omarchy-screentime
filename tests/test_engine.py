@@ -13,6 +13,7 @@ import sys
 import tempfile
 import unittest
 from datetime import date, timedelta
+from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 HELPER = os.path.join(HERE, "..", "bin", "screentime")
@@ -704,13 +705,14 @@ class TestSnapshotContract(StoreTestCase):
         self.assertEqual(missing, [], f"regenerate {self.FIXTURE}: new keys {missing}")
         self.assertEqual(stale, [], f"regenerate {self.FIXTURE}: removed keys {stale}")
 
-    def test_commit_adds_only_the_committed_key(self):
+    def test_commit_adds_only_the_committed_keys(self):
         store = {"version": 1, "days": {}}
         snap = engine.build_snapshot(store, 6, True, None, self.today, None, 6, 0)
         snap["committed"] = 0
+        snap["committedNet"] = [0, 0]
         with open(self.FIXTURE, "r", encoding="utf-8") as handle:
             recorded = set(json.load(handle))
-        self.assertEqual(set(snap.keys()) - recorded, {"committed"})
+        self.assertEqual(set(snap.keys()) - recorded, {"committed", "committedNet"})
 
 
 class TestCli(StoreTestCase):
@@ -774,6 +776,563 @@ class TestCli(StoreTestCase):
                 engine.build_parser().parse_args(
                     ["commit", "{}", "--goal", "6"]
                 )
+
+    def test_net_commands_exit_clean(self):
+        # --day is a parent-parser option, so it goes before the subcommand.
+        for argv in (["net"], ["--day", "2026-08-20", "net"]):
+            self.assertEqual(self.run_cli(argv), 0, argv)
+
+    def test_netsample_exits_clean_without_a_compositor(self):
+        """`ss` may be missing and Hyprland may not be running; neither is a
+        reason for the bar to see a failure."""
+        with mock.patch.object(engine, "run_ss", return_value=""):
+            with mock.patch.object(engine, "window_apps", return_value={}):
+                self.assertEqual(self.run_cli(["netsample"]), 0)
+
+    def test_commit_drains_what_netsample_buffered(self):
+        real_today = date.today().isoformat()
+        engine.save_net_state({
+            "sockets": {},
+            "pending": {real_today: {"helium": [4000, 500]}},
+            "started": True,
+        })
+        payload = json.dumps({"days": {real_today: {"helium": 60}}})
+        self.assertEqual(self.run_cli(["commit", payload]), 0)
+        entry = engine.load_store()["days"][real_today]
+        self.assertEqual(entry["net"]["helium"], [4000, 500])
+        self.assertEqual(entry["netTotal"], [4000, 500])
+        # Drained, so the next commit cannot bill the same bytes twice.
+        self.assertEqual(engine.load_net_state()["pending"], {})
+
+    def test_commit_with_nothing_accrued_still_drains_bytes(self):
+        """The service commits on a timer whether or not anything was focused,
+        because data moves while the seat is idle."""
+        real_today = date.today().isoformat()
+        engine.save_net_state({
+            "sockets": {},
+            "pending": {real_today: {"steam": [900, 100]}},
+            "started": True,
+        })
+        self.assertEqual(self.run_cli(["commit", json.dumps({"days": {}})]), 0)
+        entry = engine.load_store()["days"][real_today]
+        self.assertEqual(entry["net"]["steam"], [900, 100])
+        self.assertEqual(entry["total"], 0)
+
+
+class TestSteamNames(unittest.TestCase):
+    """steam_app_1091500 is not a name anyone recognises."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.library = os.path.join(self.tmp.name, "Steam", "steamapps")
+        os.makedirs(self.library)
+        engine._STEAM_CACHE.clear()
+        engine._STEAM_LIBRARIES = [self.library]
+
+    def tearDown(self):
+        engine._STEAM_CACHE.clear()
+        engine._STEAM_LIBRARIES = None
+        self.tmp.cleanup()
+
+    def write_manifest(self, appid, name, extra=""):
+        body = (
+            '"AppState"\n{\n'
+            f'\t"appid"\t\t"{appid}"\n'
+            f'\t"name"\t\t"{name}"\n'
+            f'{extra}'
+            "}\n"
+        )
+        with open(os.path.join(self.library, f"appmanifest_{appid}.acf"),
+                  "w", encoding="utf-8") as handle:
+            handle.write(body)
+
+    def test_installed_game_resolves_to_its_name(self):
+        self.write_manifest("1091500", "Cyberpunk 2077")
+        self.assertEqual(engine.pretty_name("steam_app_1091500"), "Cyberpunk 2077")
+
+    def test_nested_name_keys_do_not_win(self):
+        """A manifest's UserConfig block has its own "name"; the top-level one
+        is the game."""
+        self.write_manifest(
+            "3321460", "Crimson Desert",
+            '\t"UserConfig"\n\t{\n\t\t"name"\t\t"not the game"\n\t}\n',
+        )
+        self.assertEqual(engine.pretty_name("steam_app_3321460"), "Crimson Desert")
+
+    def test_uninstalled_game_keeps_a_readable_fallback(self):
+        self.assertEqual(engine.pretty_name("steam_app_999999"), "Steam app 999999")
+
+    def test_steam_itself_is_untouched(self):
+        self.assertEqual(engine.pretty_name("steam"), "Steam")
+
+    def test_a_name_with_whitespace_is_collapsed(self):
+        self.write_manifest("42", "Half   Life")
+        self.assertEqual(engine.pretty_name("steam_app_42"), "Half Life")
+
+    def test_lookup_is_cached_after_the_first_miss(self):
+        self.assertEqual(engine.steam_app_name("777"), None)
+        self.write_manifest("777", "Late Arrival")
+        # Deliberate: a per-process cache is what keeps a snapshot from stat-ing
+        # the library once per row.
+        self.assertEqual(engine.steam_app_name("777"), None)
+
+    def test_non_numeric_ids_are_refused(self):
+        self.assertIsNone(engine.steam_app_name("default"))
+        self.assertIsNone(engine.steam_app_name(""))
+
+    def test_libraries_are_discovered_from_libraryfolders(self):
+        engine._STEAM_LIBRARIES = None
+        home = tempfile.TemporaryDirectory()
+        self.addCleanup(home.cleanup)
+        root = os.path.join(home.name, ".local", "share", "Steam")
+        os.makedirs(os.path.join(root, "steamapps"))
+        os.makedirs(os.path.join(root, "config"))
+        second = os.path.join(home.name, "games", "SteamLibrary")
+        os.makedirs(os.path.join(second, "steamapps"))
+        with open(os.path.join(root, "config", "libraryfolders.vdf"),
+                  "w", encoding="utf-8") as handle:
+            handle.write('"libraryfolders"\n{\n\t"0"\n\t{\n'
+                         f'\t\t"path"\t\t"{second}"\n\t}}\n}}\n')
+        with mock.patch.object(os.path, "expanduser", return_value=home.name):
+            libraries = engine.steam_libraries()
+        self.assertIn(os.path.realpath(os.path.join(root, "steamapps")), libraries)
+        self.assertIn(os.path.realpath(os.path.join(second, "steamapps")), libraries)
+
+
+SS_SAMPLE = """\
+0      0      192.168.1.6:47864  172.217.70.132:443 users:(("helium",pid=53301,fd=27)) uid:1000 ino:91822 sk:101b
+\t cubic wscale:8,10 rto:260 bytes_sent:1829 bytes_acked:1830 bytes_received:11913 segs_out:11
+0      0      192.168.1.6:42300         8.8.8.8:853 uid:974 ino:219307 sk:3003
+\t cubic wscale:8,10 bytes_sent:2061 bytes_received:2079 segs_out:7
+0      0        127.0.0.1:35414        127.0.0.1:6379 users:(("redis",pid=99,fd=8)) uid:1000 ino:5555
+\t cubic bytes_sent:900000 bytes_received:900000
+0      0      192.168.1.6:50148   57.144.123.32:443 users:(("node",pid=1837,fd=24)) uid:1000 ino:0
+\t cubic bytes_sent:20367 bytes_received:87682
+"""
+
+
+class TestSsParsing(unittest.TestCase):
+    def test_socket_rows_carry_pid_and_counters(self):
+        rows = engine.parse_ss(SS_SAMPLE)
+        by_pid = {row["pid"]: row for row in rows}
+        self.assertEqual(by_pid[53301]["down"], 11913)
+        self.assertEqual(by_pid[53301]["up"], 1829)
+
+    def test_loopback_is_not_data_usage(self):
+        rows = engine.parse_ss(SS_SAMPLE)
+        self.assertNotIn(900000, [row["down"] for row in rows])
+
+    def test_sockets_without_an_inode_are_skipped(self):
+        """No inode means no identity to diff against next sample, and diffing
+        anonymous sockets would recount the same bytes on every tick."""
+        rows = engine.parse_ss(SS_SAMPLE)
+        self.assertNotIn(1837, [row["pid"] for row in rows])
+
+    def test_a_socket_owned_by_another_uid_has_no_pid(self):
+        rows = engine.parse_ss(SS_SAMPLE)
+        orphan = [row for row in rows if row["pid"] == 0]
+        self.assertEqual(len(orphan), 1)
+        self.assertEqual(orphan[0]["down"], 2079)
+
+    def test_a_leading_state_column_is_tolerated(self):
+        """`ss` prints State first unless a state filter drops it."""
+        text = ("ESTAB  0      0      192.168.1.6:1  1.1.1.1:443 "
+                "users:((\"curl\",pid=7,fd=3)) ino:12\n"
+                "\t cubic bytes_sent:10 bytes_received:20\n")
+        rows = engine.parse_ss(text)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["pid"], 7)
+        self.assertEqual(rows[0]["down"], 20)
+
+    def test_endpoints_are_part_of_the_socket_key(self):
+        """Inodes get recycled, so a reused one on a new connection must read as
+        a new socket rather than a delta against a stranger's counters."""
+        rows = engine.parse_ss(SS_SAMPLE)
+        self.assertTrue(all(row["key"].count("|") == 2 for row in rows))
+
+    def test_empty_input_is_not_an_error(self):
+        self.assertEqual(engine.parse_ss(""), [])
+        self.assertEqual(engine.parse_ss(None), [])
+
+
+class TestNetDelta(unittest.TestCase):
+    def rows(self, *specs):
+        return [{"key": key, "pid": pid, "down": down, "up": up}
+                for key, pid, down, up in specs]
+
+    def test_first_sample_only_establishes_a_baseline(self):
+        """Those counters describe traffic from before the plugin was watching."""
+        sockets, apps = engine.net_delta(
+            {}, self.rows(("a", 10, 5000, 100)), {10: "helium"}, True)
+        self.assertEqual(apps, {})
+        self.assertEqual(sockets["a"], [5000, 100])
+
+    def test_a_new_socket_contributes_its_whole_counter(self):
+        sockets, apps = engine.net_delta(
+            {}, self.rows(("a", 10, 5000, 100)), {10: "helium"}, False)
+        self.assertEqual(apps["helium"], [5000, 100])
+
+    def test_only_the_difference_since_last_sample_counts(self):
+        _, apps = engine.net_delta(
+            {"a": [1000, 50]}, self.rows(("a", 10, 5000, 100)), {10: "helium"}, False)
+        self.assertEqual(apps["helium"], [4000, 50])
+
+    def test_a_counter_that_went_backwards_is_dropped(self):
+        """A recycled inode, not lost traffic."""
+        _, apps = engine.net_delta(
+            {"a": [9000, 900]}, self.rows(("a", 10, 10, 5)), {10: "helium"}, False)
+        self.assertEqual(apps, {})
+
+    def test_an_implausible_jump_is_dropped(self):
+        _, apps = engine.net_delta(
+            {"a": [0, 0]},
+            self.rows(("a", 10, engine.MAX_SOCKET_DELTA + 1, 10)),
+            {10: "helium"}, False)
+        self.assertEqual(apps["helium"], [0, 10])
+
+    def test_sockets_of_one_app_are_summed(self):
+        _, apps = engine.net_delta(
+            {}, self.rows(("a", 10, 100, 1), ("b", 10, 200, 2)),
+            {10: "helium"}, False)
+        self.assertEqual(apps["helium"], [300, 3])
+
+    def test_traffic_with_no_owning_process_lands_in_one_bucket(self):
+        _, apps = engine.net_delta(
+            {}, self.rows(("a", 0, 100, 1)), {}, False)
+        self.assertEqual(apps, {"system": [100, 1]})
+
+    def test_closed_sockets_are_forgotten(self):
+        sockets, _ = engine.net_delta(
+            {"gone": [1, 1]}, self.rows(("a", 10, 5, 5)), {10: "x"}, False)
+        self.assertNotIn("gone", sockets)
+
+
+class TestAppForPid(unittest.TestCase):
+    def test_a_window_pid_names_itself(self):
+        self.assertEqual(engine.app_for_pid(42, {42: "helium"}, {}), "helium")
+
+    def test_a_child_process_inherits_the_window_above_it(self):
+        """A browser's network process, a game's helper and Steam's web helper
+        are all children of the process that owns the window."""
+        tree = {5: 4, 4: 3, 3: 42}
+        with mock.patch.object(engine, "proc_parent", side_effect=lambda p: tree.get(p, 0)):
+            self.assertEqual(engine.app_for_pid(5, {42: "helium"}, {}), "helium")
+
+    def test_a_process_with_no_window_falls_back_to_its_own_name(self):
+        with mock.patch.object(engine, "proc_parent", return_value=1):
+            with mock.patch.object(engine, "proc_comm", return_value="syncthing"):
+                self.assertEqual(engine.app_for_pid(9, {}, {}), "syncthing")
+
+    def test_an_unreadable_process_still_gets_a_bucket(self):
+        with mock.patch.object(engine, "proc_parent", return_value=0):
+            with mock.patch.object(engine, "proc_comm", return_value=""):
+                self.assertEqual(engine.app_for_pid(9, {}, {}), "system")
+
+    def test_a_cycle_in_the_tree_cannot_hang_the_walk(self):
+        with mock.patch.object(engine, "proc_parent", side_effect=lambda p: 7 if p == 8 else 8):
+            with mock.patch.object(engine, "proc_comm", return_value="loop"):
+                self.assertEqual(engine.app_for_pid(8, {}, {}), "loop")
+
+
+class TestNetStore(StoreTestCase):
+    def test_merge_accumulates_per_app_and_per_day(self):
+        store = {"version": 1, "days": {}}
+        engine.merge_net(store, {"2026-08-24": {"helium": [100, 10]}})
+        engine.merge_net(store, {"2026-08-24": {"helium": [50, 5], "steam": [7, 0]}})
+        entry = store["days"]["2026-08-24"]
+        self.assertEqual(entry["net"]["helium"], [150, 15])
+        self.assertEqual(entry["net"]["steam"], [7, 0])
+        self.assertEqual(entry["netTotal"], [157, 15])
+
+    def test_merge_returns_what_it_added(self):
+        store = {"version": 1, "days": {}}
+        added = engine.merge_net(store, {"2026-08-24": {"helium": [100, 10]}})
+        self.assertEqual(added, [100, 10])
+
+    def test_a_day_of_only_rejected_bytes_leaves_no_entry(self):
+        store = {"version": 1, "days": {}}
+        engine.merge_net(store, {"not-a-day": {"helium": [1, 1]}})
+        engine.merge_net(store, {"2026-08-24": {"helium": [0, 0]}})
+        self.assertEqual(store["days"], {})
+
+    def test_an_absurd_batch_is_refused(self):
+        store = {"version": 1, "days": {}}
+        engine.merge_net(store,
+                         {"2026-08-24": {"helium": [engine.MAX_BATCH_BYTES + 1, 0]}})
+        self.assertEqual(store["days"], {})
+
+    def test_merge_does_not_invent_screen_time(self):
+        store = {"version": 1, "days": {}}
+        engine.merge_net(store, {"2026-08-24": {"helium": [100, 10]}})
+        self.assertEqual(store["days"]["2026-08-24"]["total"], 0)
+
+    def test_pruning_keeps_the_day_total_and_drops_the_breakdown(self):
+        store = {"version": 1, "days": {}}
+        old = (self.today - timedelta(days=200)).isoformat()
+        engine.merge_net(store, {old: {"helium": [5000, 500]}})
+        engine.prune(store, 120, self.today)
+        entry = store["days"][old]
+        self.assertEqual(entry["net"], {})
+        self.assertEqual(entry["netTotal"], [5000, 500])
+
+    def test_bytes_added_after_pruning_still_add_up(self):
+        """Regression: recomputing netTotal from the per-app map would reset it
+        to the new batch every time detail aged out."""
+        store = {"version": 1, "days": {}}
+        old = (self.today - timedelta(days=200)).isoformat()
+        engine.merge_net(store, {old: {"helium": [5000, 500]}})
+        engine.prune(store, 120, self.today)
+        engine.merge_net(store, {old: {"helium": [1000, 100]}})
+        self.assertEqual(store["days"][old]["netTotal"], [6000, 600])
+
+    def test_load_store_survives_a_hand_edited_net_block(self):
+        engine.save_store({"version": 1, "days": {"2026-08-24": {
+            "total": 60, "apps": {"helium": 60},
+            "net": {"helium": "nonsense", "steam": [-5, 3], "gone": [0, 0]},
+            "netTotal": None,
+        }}})
+        entry = engine.load_store()["days"]["2026-08-24"]
+        self.assertNotIn("helium", entry.get("net", {}))
+        self.assertNotIn("gone", entry.get("net", {}))
+        self.assertEqual(entry["net"]["steam"], [0, 3])
+        self.assertEqual(entry["netTotal"], [0, 3])
+
+    def test_net_state_round_trips(self):
+        engine.save_net_state({
+            "sockets": {"a": [1, 2]},
+            "pending": {"2026-08-24": {"helium": [3, 4]}, "bad-day": {"x": [1, 1]}},
+            "started": True,
+        })
+        state = engine.load_net_state()
+        self.assertEqual(state["sockets"], {"a": [1, 2]})
+        self.assertEqual(state["pending"], {"2026-08-24": {"helium": [3, 4]}})
+        self.assertTrue(state["started"])
+
+    def test_a_missing_net_state_reads_as_a_first_run(self):
+        state = engine.load_net_state()
+        self.assertFalse(state["started"])
+        self.assertEqual(state["sockets"], {})
+
+    def test_sample_net_buffers_into_the_pending_day(self):
+        state = {"sockets": {}, "pending": {}, "started": True}
+        rows = [{"key": "a", "pid": 10, "down": 400, "up": 40}]
+        added = engine.sample_net(state, "2026-08-24", rows, {10: "helium"})
+        self.assertEqual(added, [400, 40])
+        self.assertEqual(state["pending"]["2026-08-24"]["helium"], [400, 40])
+        self.assertEqual(state["sockets"]["a"], [400, 40])
+
+    def test_the_very_first_sample_buffers_nothing(self):
+        state = {"sockets": {}, "pending": {}, "started": False}
+        rows = [{"key": "a", "pid": 10, "down": 400, "up": 40}]
+        self.assertEqual(engine.sample_net(state, "2026-08-24", rows, {10: "helium"}),
+                         [0, 0])
+        self.assertEqual(state["pending"], {})
+        self.assertTrue(state["started"])
+
+    def test_drain_moves_the_buffer_into_the_store_once(self):
+        engine.save_net_state({
+            "sockets": {}, "started": True,
+            "pending": {"2026-08-24": {"helium": [800, 80]}},
+        })
+        store = {"version": 1, "days": {}}
+        self.assertEqual(engine.drain_net(store), [800, 80])
+        self.assertEqual(engine.drain_net(store), [0, 0])
+        self.assertEqual(store["days"]["2026-08-24"]["net"]["helium"], [800, 80])
+
+
+class TestNetSnapshot(StoreTestCase):
+    def snapshot_with_net(self, seconds, net):
+        key = self.today.isoformat()
+        store = {"version": 1, "days": {key: {
+            "total": sum(seconds.values()), "apps": dict(seconds),
+        }}}
+        engine.merge_net(store, {key: net})
+        return engine.build_snapshot(store, 6, True, None, self.today, key, 6, 0)
+
+    def test_day_totals_are_reported_both_ways(self):
+        snap = self.snapshot_with_net({"helium": 600}, {"helium": [2_000_000, 250_000]})
+        self.assertEqual(snap["todayNet"]["down"], 2_000_000)
+        self.assertEqual(snap["todayNet"]["downLabel"], "2.0 MB")
+        self.assertEqual(snap["todayNet"]["upLabel"], "250 kB")
+        self.assertEqual(snap["selectedNet"]["down"], 2_000_000)
+
+    def test_a_folder_row_carries_its_own_bytes(self):
+        snap = self.snapshot_with_net({"helium/YouTube": 600}, {"helium": [900, 90]})
+        row = snap["todayTree"][0]
+        self.assertEqual(row["app"], "helium")
+        self.assertTrue(row["netKnown"])
+        self.assertEqual(row["net"]["down"], 900)
+
+    def test_detail_rows_claim_no_bytes_of_their_own(self):
+        """Which tab downloaded what is not something the socket table can
+        answer, and repeating the app's total on each child would read as if it
+        had been counted several times."""
+        snap = self.snapshot_with_net({"helium/YouTube": 600}, {"helium": [900, 90]})
+        child = snap["todayTree"][0]["children"][0]
+        self.assertEqual(child["name"], "YouTube")
+        self.assertFalse(child["netKnown"])
+        self.assertEqual(child["net"]["down"], 0)
+
+    def test_an_app_that_only_moved_data_still_gets_a_row(self):
+        """A download that finished while the screen was locked is exactly the
+        thing you open this panel to find."""
+        snap = self.snapshot_with_net({"helium": 600}, {"syncthing": [5000, 5000]})
+        names = [row["app"] for row in snap["todayTree"]]
+        self.assertIn("syncthing", names)
+        row = [r for r in snap["todayTree"] if r["app"] == "syncthing"][0]
+        self.assertEqual(row["seconds"], 0)
+        self.assertEqual(row["label"], "0m")
+
+    def test_apps_with_time_still_sort_above_apps_with_only_data(self):
+        snap = self.snapshot_with_net({"helium": 60}, {"syncthing": [10 ** 9, 0]})
+        self.assertEqual(snap["todayTree"][0]["app"], "helium")
+
+    def test_grouped_rows_carry_bytes_too(self):
+        snap = self.snapshot_with_net({"helium/YouTube": 600}, {"helium": [900, 90]})
+        row = snap["todayByApp"][0]
+        self.assertEqual(row["app"], "helium")
+        self.assertTrue(row["netKnown"])
+
+    def test_week_and_all_time_roll_up(self):
+        snap = self.snapshot_with_net({"helium": 600}, {"helium": [1500, 150]})
+        self.assertEqual(snap["weekNet"]["down"], 1500)
+        self.assertEqual(snap["allTimeNet"]["down"], 1500)
+        self.assertEqual(snap["rangeNet"]["down"], 1500)
+
+    def test_net_tracked_is_false_until_something_is_measured(self):
+        snap = engine.build_snapshot(
+            self.store_with({self.today.isoformat(): {"helium": 60}}),
+            6, True, None, self.today, None, 6, 0)
+        self.assertFalse(snap["netTracked"])
+        self.assertEqual(snap["todayNet"]["down"], 0)
+
+    def test_a_day_with_only_bytes_reaches_the_all_time_total(self):
+        """Days are only "tracked" when they have seconds on them; bytes have to
+        be counted from every day in the store instead."""
+        store = {"version": 1, "days": {}}
+        engine.merge_net(store, {(self.today - timedelta(days=1)).isoformat():
+                                 {"syncthing": [7000, 0]}})
+        snap = engine.build_snapshot(store, 6, True, None, self.today, None, 6, 0)
+        self.assertEqual(snap["allTimeNet"]["down"], 7000)
+        self.assertTrue(snap["netTracked"])
+
+    def test_week_rows_carry_their_own_day_totals(self):
+        snap = self.snapshot_with_net({"helium": 600}, {"helium": [1500, 150]})
+        latest = snap["weekDays"][-1]
+        self.assertEqual(latest["net"]["down"], 1500)
+
+
+class TestResidualTraffic(unittest.TestCase):
+    """The kernel keeps no byte counters on UDP sockets, so QUIC would vanish."""
+
+    def test_the_gap_between_the_wire_and_the_sockets_is_kept(self):
+        self.assertEqual(
+            engine.residual_traffic([1000, 100], [9000, 300], [2000, 50]),
+            [6000, 150])
+
+    def test_traffic_fully_accounted_for_leaves_nothing_over(self):
+        self.assertEqual(
+            engine.residual_traffic([0, 0], [500, 50], [500, 50]), [0, 0])
+
+    def test_more_attributed_than_the_wire_saw_is_not_negative(self):
+        self.assertEqual(
+            engine.residual_traffic([0, 0], [100, 10], [900, 90]), [0, 0])
+
+    def test_a_reboot_or_a_link_bounce_is_not_traffic(self):
+        self.assertEqual(
+            engine.residual_traffic([9000, 900], [10, 1], [0, 0]), [0, 0])
+
+    def test_an_implausible_jump_is_refused(self):
+        self.assertEqual(
+            engine.residual_traffic([0, 0],
+                                    [engine.MAX_SOCKET_DELTA + 1, 0], [0, 0]),
+            [0, 0])
+
+    def test_junk_readings_are_zero(self):
+        self.assertEqual(engine.residual_traffic(None, None, None), [0, 0])
+
+    def test_only_real_devices_are_summed(self):
+        """A tunnel's bytes are also counted on the NIC that carries them, so
+        adding both would double every VPN byte."""
+        with mock.patch.object(engine, "physical_interfaces", return_value=["wlan0"]):
+            with mock.patch("builtins.open", mock.mock_open(read_data=(
+                "Inter-|   Receive\n face |bytes\n"
+                "    lo: 100 1 0 0 0 0 0 0 200 2 0 0 0 0 0 0\n"
+                " wlan0: 500 5 0 0 0 0 0 0 700 7 0 0 0 0 0 0\n"
+                "  tun0: 900 9 0 0 0 0 0 0 900 9 0 0 0 0 0 0\n"
+            ))):
+                self.assertEqual(engine.read_interface_bytes(), [500, 700])
+
+    def test_no_devices_at_all_reads_as_nothing(self):
+        self.assertEqual(engine.read_interface_bytes([]), [0, 0])
+
+    def test_sample_net_buckets_the_residual(self):
+        state = {"sockets": {}, "pending": {}, "interfaces": [0, 0], "started": True}
+        rows = [{"key": "a", "pid": 10, "down": 1000, "up": 100}]
+        added = engine.sample_net(state, "2026-08-24", rows, {10: "helium"},
+                                  [50000, 4000])
+        bucket = state["pending"]["2026-08-24"]
+        self.assertEqual(bucket["helium"], [1000, 100])
+        self.assertEqual(bucket["other-traffic"], [49000, 3900])
+        self.assertEqual(added, [50000, 4000])
+        self.assertEqual(state["interfaces"], [50000, 4000])
+
+    def test_the_first_sample_only_baselines_the_interfaces(self):
+        state = {"sockets": {}, "pending": {}, "started": False}
+        engine.sample_net(state, "2026-08-24", [], {}, [900000, 90000])
+        self.assertEqual(state["pending"], {})
+        self.assertEqual(state["interfaces"], [900000, 90000])
+
+    def test_the_bucket_has_a_readable_name(self):
+        self.assertEqual(engine.pretty_name("other-traffic"), "Other traffic")
+
+    def test_steam_and_its_web_helper_do_not_share_a_name(self):
+        """Two rows both called "Steam" is worse than one with a longer name."""
+        self.assertNotEqual(engine.pretty_name("steam"),
+                            engine.pretty_name("Steamwebhelper"))
+
+
+class TestByteFormatting(unittest.TestCase):
+    def test_decimal_units(self):
+        self.assertEqual(engine.format_bytes(0), "0 B")
+        self.assertEqual(engine.format_bytes(999), "999 B")
+        self.assertEqual(engine.format_bytes(1000), "1.0 kB")
+        self.assertEqual(engine.format_bytes(1500), "1.5 kB")
+        self.assertEqual(engine.format_bytes(12_000), "12 kB")
+        self.assertEqual(engine.format_bytes(9_400_000), "9.4 MB")
+        self.assertEqual(engine.format_bytes(1_234_567_890), "1.2 GB")
+
+    def test_junk_is_zero_rather_than_a_crash(self):
+        self.assertEqual(engine.format_bytes(-5), "0 B")
+        self.assertEqual(engine.format_bytes(None), "0 B")
+        self.assertEqual(engine.format_bytes("nonsense"), "0 B")
+
+    def test_pairs_are_coerced_from_anything(self):
+        self.assertEqual(engine.clean_pair([5, 6]), [5, 6])
+        self.assertEqual(engine.clean_pair({"d": 5, "u": 6}), [5, 6])
+        self.assertEqual(engine.clean_pair({"down": 5, "up": 6}), [5, 6])
+        self.assertEqual(engine.clean_pair([-1]), [0, 0])
+        self.assertEqual(engine.clean_pair("nope"), [0, 0])
+        self.assertEqual(engine.clean_pair(None), [0, 0])
+
+    def test_net_summary_reads_down_first(self):
+        summary = engine.net_summary([2000, 1000])
+        self.assertEqual(summary["label"], "D 2.0 kB \u00b7 U 1.0 kB")
+        self.assertEqual(summary["total"], 3000)
+
+
+class TestLock(StoreTestCase):
+    def test_the_lock_is_reentrant_across_sequential_uses(self):
+        with engine.Lock():
+            pass
+        with engine.Lock():
+            pass
+        self.assertTrue(os.path.exists(engine.lock_path()))
+
+    def test_an_unwritable_data_dir_does_not_raise(self):
+        os.environ["XDG_DATA_HOME"] = "/proc/nonexistent-for-tests"
+        with engine.Lock():
+            pass
 
 
 if __name__ == "__main__":

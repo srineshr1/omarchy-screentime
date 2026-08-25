@@ -9,17 +9,25 @@ Store: $XDG_DATA_HOME/omarchy-screentime/history.json
     {
       "version": 1,
       "days": {
-        "2026-08-24": {"total": 15043, "apps": {"firefox": 9001, "ghostty": 6042}}
+        "2026-08-24": {
+          "total": 15043,
+          "apps": {"firefox": 9001, "ghostty": 6042},
+          "net": {"firefox": [80412345, 2210496]},
+          "netTotal": [80412345, 2210496]
+        }
       }
     }
 
-Seconds, integers. `total` is authoritative and survives detail pruning, so a
-day whose per-app breakdown has aged out still reports its total.
+`total` and `apps` are seconds; `net` is `[down, up]` in bytes. Both totals are
+authoritative and survive detail pruning, so a day whose per-app breakdown has
+aged out still reports what it added up to.
 
 Subcommands
-    commit <json>   merge accrued seconds, then print a fresh snapshot
+    commit <json>   merge accrued seconds, drain net samples, print a snapshot
     snapshot        print the snapshot the UI renders
     today           human-readable today
+    net             per-app data usage
+    netsample       sample per-socket byte counters into the pending buffer
     week            human-readable last 7 days
     year [YYYY]     ASCII contribution heatmap in the terminal
     json            dump the raw store
@@ -30,9 +38,12 @@ Subcommands
 from __future__ import annotations
 
 import argparse
+import fcntl
 import json
 import os
 import re
+import socket
+import subprocess
 import sys
 import tempfile
 from datetime import date, datetime, timedelta
@@ -74,6 +85,10 @@ ALIASES = {
     "mpv": "mpv",
     "vlc": "VLC",
     "steam": "Steam",
+    # Steam's own store/friends windows are a separate class. Calling them
+    # "Steam" too would put two rows with the same name in the list.
+    "steamwebhelper": "Steam Web Helper",
+    "gamescope": "Gamescope",
     "org.gnome.nautilus": "Files",
     "nautilus": "Files",
     "thunar": "Thunar",
@@ -88,9 +103,27 @@ ALIASES = {
     "org.keepassxc.keepassxc": "KeePassXC",
     "whatsapp": "WhatsApp",
     "hyprland": "Desktop",
+    # Traffic from sockets we cannot attribute to one of the user's own
+    # processes: system daemons, and anything running as another uid.
+    "system": "System",
+    # The gap between what the interface counters moved and what the TCP
+    # sockets account for: QUIC / HTTP3, and packet headers.
+    "other-traffic": "Other traffic",
 }
 
 _DESKTOP_CACHE: dict[str, str | None] = {}
+_STEAM_CACHE: dict[str, str | None] = {}
+_STEAM_LIBRARIES: list | None = None
+
+# Hyprland reports a Steam game's window as steam_app_<appid>, which is how the
+# id reaches the store. "Steam app 1091500" is not a game anyone recognises, so
+# the id is looked up in Steam's own on-disk manifests.
+STEAM_APP_RE = re.compile(r"^steam_app_(\d+)$")
+# Only the top-level "name" of an appmanifest: nested config blocks have their
+# own name keys, and they are indented deeper than one tab.
+ACF_NAME_RE = re.compile(r'^\t"name"\s+"([^"]*)"', re.M)
+ACF_ANY_NAME_RE = re.compile(r'"name"\s+"([^"]*)"')
+VDF_PATH_RE = re.compile(r'"path"\s+"([^"]*)"')
 
 
 # ---------------------------------------------------------------- store paths
@@ -110,6 +143,75 @@ def store_path() -> str:
     return os.path.join(data_dir(), "history.json")
 
 
+def net_state_path() -> str:
+    """Per-socket byte counters plus bytes not yet folded into the store.
+
+    Kept out of history.json because it is rewritten every sample, and
+    history.json is only rewritten once a minute.
+    """
+    return os.path.join(data_dir(), "netstate.json")
+
+
+def lock_path() -> str:
+    return os.path.join(data_dir(), ".lock")
+
+
+class Lock:
+    """Serialises read-modify-write across every writer in the data dir.
+
+    `commit` and `netsample` both fold new numbers into files they first have to
+    read, and they run on independent timers. Without this, two overlapping runs
+    would each write a copy of the store built from the same starting point and
+    one batch would silently vanish.
+    """
+
+    def __init__(self, timeout: float = 5.0) -> None:
+        self.timeout = timeout
+        self._handle = None
+
+    def __enter__(self):
+        try:
+            os.makedirs(data_dir(), exist_ok=True)
+            self._handle = open(lock_path(), "a+")
+            fcntl.flock(self._handle.fileno(), fcntl.LOCK_EX)
+        except OSError:
+            # A read-only or missing data dir is a real error, but it will be
+            # raised again by the write that follows; failing here would turn a
+            # recoverable miss into no data at all.
+            if self._handle is not None:
+                try:
+                    self._handle.close()
+                except OSError:
+                    pass
+                self._handle = None
+        return self
+
+    def __exit__(self, *_exc) -> bool:
+        if self._handle is not None:
+            try:
+                fcntl.flock(self._handle.fileno(), fcntl.LOCK_UN)
+            finally:
+                try:
+                    self._handle.close()
+                except OSError:
+                    pass
+                self._handle = None
+        return False
+
+
+def clean_pair(value: object) -> list:
+    """A [down, up] byte pair, from anything."""
+    if isinstance(value, (list, tuple)):
+        down = to_int(value[0]) if len(value) > 0 else 0
+        up = to_int(value[1]) if len(value) > 1 else 0
+    elif isinstance(value, dict):
+        down = to_int(value.get("d", value.get("down")))
+        up = to_int(value.get("u", value.get("up")))
+    else:
+        return [0, 0]
+    return [max(0, down), max(0, up)]
+
+
 def load_store() -> dict:
     try:
         with open(store_path(), "r", encoding="utf-8") as handle:
@@ -127,7 +229,14 @@ def load_store() -> dict:
             continue
         apps = value.get("apps")
         apps = apps if isinstance(apps, dict) else {}
-        clean[key] = {
+        net = value.get("net")
+        net = net if isinstance(net, dict) else {}
+        net_clean = {}
+        for app, pair in net.items():
+            pair = clean_pair(pair)
+            if pair[0] > 0 or pair[1] > 0:
+                net_clean[str(app)] = pair
+        entry = {
             "total": max(0, to_int(value.get("total"))),
             "apps": {
                 str(app): max(0, to_int(secs))
@@ -135,12 +244,23 @@ def load_store() -> dict:
                 if to_int(secs) > 0
             },
         }
+        net_total = clean_pair(value.get("netTotal"))
+        summed = sum_pairs(net_clean.values())
+        net_total = [max(net_total[0], summed[0]), max(net_total[1], summed[1])]
+        if net_clean:
+            entry["net"] = net_clean
+        if net_total[0] > 0 or net_total[1] > 0:
+            entry["netTotal"] = net_total
+        clean[key] = entry
     return {"version": VERSION, "days": clean}
 
 
 def save_store(store: dict) -> None:
+    write_json(store_path(), store)
+
+
+def write_json(target: str, payload: dict) -> None:
     """Atomic: write a sibling temp file then rename over the target."""
-    target = store_path()
     os.makedirs(os.path.dirname(target), exist_ok=True)
     handle = tempfile.NamedTemporaryFile(
         mode="w",
@@ -152,7 +272,7 @@ def save_store(store: dict) -> None:
     )
     try:
         with handle:
-            json.dump(store, handle, separators=(",", ":"), sort_keys=True)
+            json.dump(payload, handle, separators=(",", ":"), sort_keys=True)
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(handle.name, target)
@@ -162,6 +282,49 @@ def save_store(store: dict) -> None:
         except OSError:
             pass
         raise
+
+
+def load_net_state() -> dict:
+    """{"sockets": {key: [down, up]}, "pending": {day: {app: [down, up]}}}"""
+    try:
+        with open(net_state_path(), "r", encoding="utf-8") as handle:
+            raw = json.load(handle)
+    except (OSError, ValueError):
+        return {"sockets": {}, "pending": {}, "interfaces": [0, 0], "started": False}
+    if not isinstance(raw, dict):
+        return {"sockets": {}, "pending": {}, "interfaces": [0, 0], "started": False}
+    sockets = raw.get("sockets")
+    pending = raw.get("pending")
+    clean_sockets = {}
+    if isinstance(sockets, dict):
+        for key, pair in sockets.items():
+            clean_sockets[str(key)] = clean_pair(pair)
+    clean_pending: dict[str, dict] = {}
+    if isinstance(pending, dict):
+        for day, apps in pending.items():
+            if not is_day_key(day) or not isinstance(apps, dict):
+                continue
+            bucket = {}
+            for app, pair in apps.items():
+                pair = clean_pair(pair)
+                if pair[0] > 0 or pair[1] > 0:
+                    bucket[str(app)] = pair
+            if bucket:
+                clean_pending[day] = bucket
+    return {
+        "sockets": clean_sockets,
+        "pending": clean_pending,
+        # The previous reading of the interface counters, so the traffic no TCP
+        # socket accounted for can be worked out.
+        "interfaces": clean_pair(raw.get("interfaces")),
+        # False only before the very first sample, which is the one sample whose
+        # counters describe traffic from before we were watching.
+        "started": raw.get("started") is True,
+    }
+
+
+def save_net_state(state: dict) -> None:
+    write_json(net_state_path(), state)
 
 
 # ------------------------------------------------------------------- helpers
@@ -247,6 +410,55 @@ def format_duration(seconds: int) -> str:
     return f"{seconds}s" if seconds else "0m"
 
 
+def sum_pairs(pairs) -> list:
+    down = 0
+    up = 0
+    for pair in pairs:
+        clean = clean_pair(pair)
+        down += clean[0]
+        up += clean[1]
+    return [down, up]
+
+
+def add_pair(target: dict, key: str, pair) -> None:
+    existing = clean_pair(target.get(key))
+    incoming = clean_pair(pair)
+    target[key] = [existing[0] + incoming[0], existing[1] + incoming[1]]
+
+
+def format_bytes(count: int) -> str:
+    """Decimal units, the way every ISP and speed test counts them.
+
+    One decimal place under 10 of a unit and none above it, so a column of
+    these stays the same width: "9.4 MB", "12 MB", "1.2 GB".
+    """
+    total = max(0, to_int(count))
+    if total < 1000:
+        return f"{total} B"
+    value = float(total)
+    for unit in ("kB", "MB", "GB", "TB"):
+        value /= 1000.0
+        if value < 1000 or unit == "TB":
+            if value < 10:
+                return f"{value:.1f} {unit}"
+            return f"{round(value)} {unit}"
+    return f"{total} B"
+
+
+def net_summary(pair) -> dict:
+    """The shape every net field in the snapshot takes."""
+    clean = clean_pair(pair)
+    return {
+        "down": clean[0],
+        "up": clean[1],
+        "total": clean[0] + clean[1],
+        "downLabel": format_bytes(clean[0]),
+        "upLabel": format_bytes(clean[1]),
+        "totalLabel": format_bytes(clean[0] + clean[1]),
+        "label": f"D {format_bytes(clean[0])} \u00b7 U {format_bytes(clean[1])}",
+    }
+
+
 def split_key(key: str) -> tuple:
     """Store keys are "appId" or "appId/detail".
 
@@ -269,6 +481,12 @@ def pretty_name(app_id: str) -> str:
     lowered = raw.lower()
     if lowered in ALIASES:
         return ALIASES[lowered]
+    steam = STEAM_APP_RE.match(lowered)
+    if steam:
+        # An installed game names itself in its own manifest. An uninstalled one
+        # cannot, and falls through to "Steam app <id>" — still better than
+        # dropping the row, since the hours were real.
+        return steam_app_name(steam.group(1)) or f"Steam app {steam.group(1)}"
     from_desktop = desktop_name(raw)
     if from_desktop:
         return from_desktop
@@ -280,6 +498,93 @@ def pretty_name(app_id: str) -> str:
     if tail.islower():
         return tail[:1].upper() + tail[1:]
     return tail
+
+
+def steam_roots() -> list:
+    """Every place a Steam install might live, native or Flatpak."""
+    home = os.path.expanduser("~")
+    return [
+        os.path.join(home, ".local", "share", "Steam"),
+        os.path.join(home, ".steam", "steam"),
+        os.path.join(home, ".steam", "root"),
+        os.path.join(home, ".var", "app", "com.valvesoftware.Steam",
+                     "data", "Steam"),
+        os.path.join(home, "snap", "steam", "common", ".local", "share", "Steam"),
+    ]
+
+
+def steam_libraries() -> list:
+    """Directories that hold appmanifest_*.acf files.
+
+    Games are commonly on a second drive, so the install roots are only the
+    starting point: each one's libraryfolders.vdf lists where the rest live.
+    """
+    global _STEAM_LIBRARIES
+    if _STEAM_LIBRARIES is not None:
+        return _STEAM_LIBRARIES
+
+    found: list = []
+    seen: set = set()
+
+    def remember(path: str) -> None:
+        try:
+            real = os.path.realpath(path)
+        except OSError:
+            return
+        if real in seen or not os.path.isdir(real):
+            return
+        seen.add(real)
+        found.append(real)
+
+    roots = list(steam_roots())
+    for root in roots:
+        remember(os.path.join(root, "steamapps"))
+
+    for root in roots:
+        for name in ("steamapps/libraryfolders.vdf", "config/libraryfolders.vdf"):
+            candidate = os.path.join(root, name)
+            if not os.path.isfile(candidate):
+                continue
+            try:
+                with open(candidate, "r", encoding="utf-8", errors="replace") as handle:
+                    text = handle.read(200000)
+            except OSError:
+                continue
+            for path in VDF_PATH_RE.findall(text):
+                if not path:
+                    continue
+                # A library path names the drive root; manifests sit one level in.
+                remember(os.path.join(path, "steamapps"))
+                remember(path)
+
+    _STEAM_LIBRARIES = found
+    return found
+
+
+def steam_app_name(appid: str) -> str | None:
+    key = str(appid or "").strip()
+    if not key.isdigit():
+        return None
+    if key in _STEAM_CACHE:
+        return _STEAM_CACHE[key]
+    result: str | None = None
+    for library in steam_libraries():
+        candidate = os.path.join(library, f"appmanifest_{key}.acf")
+        if not os.path.isfile(candidate):
+            continue
+        try:
+            with open(candidate, "r", encoding="utf-8", errors="replace") as handle:
+                text = handle.read(65536)
+        except OSError:
+            continue
+        match = ACF_NAME_RE.search(text) or ACF_ANY_NAME_RE.search(text)
+        if match:
+            name = re.sub(r"\s+", " ", match.group(1)).strip()
+            if name:
+                result = name
+                break
+    _STEAM_CACHE[key] = result
+    return result
 
 
 def desktop_name(app_id: str) -> str | None:
@@ -390,11 +695,459 @@ def prune(store: dict, retention_days: int, today: date) -> int:
             continue
         if when >= cutoff:
             continue
+        touched = False
         if entry.get("apps"):
             entry["total"] = max(to_int(entry.get("total")), sum(entry["apps"].values()))
             entry["apps"] = {}
+            touched = True
+        if entry.get("net"):
+            total = clean_pair(entry.get("netTotal"))
+            summed = sum_pairs(entry["net"].values())
+            entry["netTotal"] = [max(total[0], summed[0]), max(total[1], summed[1])]
+            entry["net"] = {}
+            touched = True
+        if touched:
             dropped += 1
     return dropped
+
+
+# ------------------------------------------------------------------- network
+#
+# Per-app data usage, without root and without a kernel module.
+#
+# `ss -tinep` reports every TCP socket this user owns together with the pid
+# holding it and the socket's own lifetime byte counters. Sampling that on a
+# timer and diffing per socket gives per-process traffic; walking each pid up to
+# the process that owns a window turns that into per-app traffic, keyed the same
+# way as screen time so the two line up in one row.
+#
+# Two things this cannot see, both documented in the README:
+#   * UDP, and therefore QUIC / HTTP3. The kernel keeps no byte counters on UDP
+#     sockets, so a browser talking HTTP3 undercounts.
+#   * The tail of a socket's life. Bytes moved after the last sample that saw a
+#     socket go with it when it closes.
+
+SS_PID_RE = re.compile(r"pid=(\d+)")
+SS_INO_RE = re.compile(r"\bino:(\d+)")
+SS_SENT_RE = re.compile(r"\bbytes_sent:(\d+)")
+SS_RECV_RE = re.compile(r"\bbytes_received:(\d+)")
+
+# Traffic that never left the machine is not data usage.
+LOOPBACK_PREFIXES = ("127.", "[::1]", "::1", "[::ffff:127.")
+
+# A single socket cannot plausibly move this much between two samples; a jump
+# past it means the kernel reused the inode under us, not a fast download.
+MAX_SOCKET_DELTA = 64 * 1000 ** 3
+# Per app, per drained batch. Rejects a corrupted buffer without rejecting a
+# genuinely large download.
+MAX_BATCH_BYTES = 1000 ** 4
+
+_PROC_STAT_CACHE: dict = {}
+
+
+def is_loopback(address: str) -> bool:
+    text = str(address or "")
+    return any(text.startswith(prefix) for prefix in LOOPBACK_PREFIXES)
+
+
+def parse_ss(text: str) -> list:
+    """Rows of {"key", "pid", "down", "up"} from `ss -tinepH` output.
+
+    `ss -i` prints each socket as a header line plus an indented detail line, so
+    the counters belong to whichever socket was named last.
+    """
+    rows: list = []
+    current: dict | None = None
+    for raw_line in str(text or "").splitlines():
+        if not raw_line.strip():
+            continue
+        if raw_line[0].isspace():
+            if current is None:
+                continue
+            sent = SS_SENT_RE.search(raw_line)
+            recv = SS_RECV_RE.search(raw_line)
+            if sent:
+                current["up"] = to_int(sent.group(1))
+            if recv:
+                current["down"] = to_int(recv.group(1))
+            continue
+
+        if current is not None:
+            rows.append(current)
+            current = None
+
+        parts = raw_line.split()
+        # With an explicit state filter `ss` drops the State column; without one
+        # it leads with it. Recv-Q is always a number, so it tells them apart.
+        offset = 0 if parts and parts[0].isdigit() else 1
+        if len(parts) < offset + 4:
+            continue
+        local = parts[offset + 2]
+        peer = parts[offset + 3]
+        if is_loopback(local) or is_loopback(peer):
+            continue
+        ino = SS_INO_RE.search(raw_line)
+        if not ino or ino.group(1) == "0":
+            # No inode means no stable identity across samples, and diffing
+            # anonymous sockets would double count on every tick.
+            continue
+        pid = SS_PID_RE.search(raw_line)
+        current = {
+            # Inodes are recycled, so the endpoints ride along: a reused inode
+            # on a new connection reads as a new socket rather than a delta
+            # against a stranger's counters.
+            "key": f"{ino.group(1)}|{local}|{peer}",
+            "pid": to_int(pid.group(1)) if pid else 0,
+            "down": 0,
+            "up": 0,
+        }
+
+        sent = SS_SENT_RE.search(raw_line)
+        recv = SS_RECV_RE.search(raw_line)
+        if sent:
+            current["up"] = to_int(sent.group(1))
+        if recv:
+            current["down"] = to_int(recv.group(1))
+
+    if current is not None:
+        rows.append(current)
+    return rows
+
+
+def run_ss() -> str:
+    try:
+        result = subprocess.run(
+            ["ss", "-tinepH", "state", "connected"],
+            capture_output=True, text=True, timeout=5, check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return result.stdout or ""
+
+
+def hypr_request(command: bytes) -> object:
+    """One request to Hyprland's control socket. None on any failure."""
+    signature = os.environ.get("HYPRLAND_INSTANCE_SIGNATURE")
+    if not signature:
+        return None
+    runtime = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
+    path = os.path.join(runtime, "hypr", signature, ".socket.sock")
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+            sock.settimeout(1.0)
+            sock.connect(path)
+            sock.sendall(command)
+            chunks = []
+            while True:
+                block = sock.recv(65536)
+                if not block:
+                    break
+                chunks.append(block)
+        return json.loads(b"".join(chunks).decode("utf-8", "replace"))
+    except (OSError, ValueError):
+        return None
+
+
+def window_apps() -> dict:
+    """pid -> app id, for every window the compositor currently has open."""
+    clients = hypr_request(b"j/clients")
+    out: dict = {}
+    if not isinstance(clients, list):
+        return out
+    for client in clients:
+        if not isinstance(client, dict):
+            continue
+        pid = to_int(client.get("pid"))
+        app = str(client.get("class") or "").strip()
+        if pid > 0 and app:
+            out.setdefault(pid, app.split("/")[-1][:128])
+    return out
+
+
+def proc_parent(pid: int) -> int:
+    if pid in _PROC_STAT_CACHE:
+        return _PROC_STAT_CACHE[pid]
+    parent = 0
+    try:
+        with open(f"/proc/{pid}/stat", "r", encoding="utf-8", errors="replace") as handle:
+            raw = handle.read()
+        close = raw.rfind(")")
+        rest = raw[close + 2:].split()
+        if len(rest) >= 2:
+            parent = to_int(rest[1])
+    except (OSError, IndexError):
+        parent = 0
+    _PROC_STAT_CACHE[pid] = parent
+    return parent
+
+
+def proc_comm(pid: int) -> str:
+    try:
+        with open(f"/proc/{pid}/comm", "r", encoding="utf-8", errors="replace") as handle:
+            return handle.read().strip().split("/")[-1][:128]
+    except OSError:
+        return ""
+
+
+def app_for_pid(pid: int, windows: dict, cache: dict) -> str:
+    """The app a socket belongs to.
+
+    A browser's network process, a game's helper and Steam's web helper are all
+    children of the process that owns the window, so walking up the tree lands
+    on the same app id screen time is recorded against. Anything with no window
+    above it — a daemon, a CLI download — falls back to its own name, which is
+    what you would want to read in the list anyway.
+    """
+    if pid <= 0:
+        # `ss` withholds the pid for sockets owned by other uids: system
+        # resolvers, VPN daemons. Their bytes are real, so they are kept in one
+        # bucket rather than dropped.
+        return "system"
+    if pid in cache:
+        return cache[pid]
+
+    seen = []
+    cursor = pid
+    found = ""
+    for _ in range(12):
+        if cursor <= 1:
+            break
+        if cursor in cache:
+            found = cache[cursor]
+            break
+        seen.append(cursor)
+        if cursor in windows:
+            found = windows[cursor]
+            break
+        cursor = proc_parent(cursor)
+
+    if not found:
+        found = proc_comm(pid) or "system"
+    for step in seen:
+        cache[step] = found
+    return found
+
+
+def physical_interfaces() -> list:
+    """Interfaces that carry traffic in and out of the machine.
+
+    A real NIC has a `device` link under /sys/class/net; loopback, docker's
+    veth pairs and a VPN's tun do not. Excluding the virtual ones is not
+    tidiness — a tunnel's bytes are also counted on the NIC that carries them,
+    so adding both would double every VPN byte.
+    """
+    names = []
+    try:
+        candidates = sorted(os.listdir("/sys/class/net"))
+    except OSError:
+        return names
+    for name in candidates:
+        if os.path.exists(os.path.join("/sys/class/net", name, "device")):
+            names.append(name)
+    return names
+
+
+def read_interface_bytes(names: list | None = None) -> list:
+    """[received, transmitted] summed over the real interfaces."""
+    wanted = set(names if names is not None else physical_interfaces())
+    if not wanted:
+        return [0, 0]
+    down = 0
+    up = 0
+    try:
+        with open("/proc/net/dev", "r", encoding="utf-8", errors="replace") as handle:
+            for line in handle:
+                if ":" not in line:
+                    continue
+                name, _, rest = line.partition(":")
+                if name.strip() not in wanted:
+                    continue
+                fields = rest.split()
+                if len(fields) < 9:
+                    continue
+                down += to_int(fields[0])
+                up += to_int(fields[8])
+    except OSError:
+        return [0, 0]
+    return [down, up]
+
+
+def net_delta(previous: dict, rows: list, windows: dict, first_run: bool) -> tuple:
+    """(sockets to remember, {app: [down, up]}) for the traffic since last time.
+
+    A socket seen for the first time contributes its whole counter, because it
+    was opened after the previous sample. The very first sample of all is the
+    exception: those counters describe traffic from before the plugin was
+    watching, so they only establish a baseline.
+    """
+    sockets: dict = {}
+    apps: dict = {}
+    cache: dict = {}
+    for row in rows:
+        key = str(row.get("key") or "")
+        if not key:
+            continue
+        down = max(0, to_int(row.get("down")))
+        up = max(0, to_int(row.get("up")))
+        sockets[key] = [down, up]
+        if first_run:
+            continue
+        before = clean_pair(previous.get(key)) if key in previous else [0, 0]
+        delta_down = down - before[0]
+        delta_up = up - before[1]
+        # A counter that went backwards is a recycled inode, not lost traffic.
+        if delta_down < 0:
+            delta_down = 0
+        if delta_up < 0:
+            delta_up = 0
+        if delta_down > MAX_SOCKET_DELTA:
+            delta_down = 0
+        if delta_up > MAX_SOCKET_DELTA:
+            delta_up = 0
+        if delta_down == 0 and delta_up == 0:
+            continue
+        add_pair(apps, app_for_pid(to_int(row.get("pid")), windows, cache),
+                 [delta_down, delta_up])
+    return sockets, apps
+
+
+def residual_traffic(previous: list, current: list, attributed: list) -> list:
+    """What the interface moved that no TCP socket accounted for.
+
+    The kernel keeps byte counters on TCP sockets and not on UDP ones, so a
+    browser talking QUIC would otherwise read as zero while it streams video.
+    Comparing against the interface counters cannot say *which* app it was, but
+    it can stop the traffic disappearing: the difference lands in one bucket.
+
+    Packet headers are in here too, which is why the bucket is never exactly
+    zero even on a machine with no QUIC at all.
+    """
+    before = clean_pair(previous)
+    now = clean_pair(current)
+    used = clean_pair(attributed)
+    out = []
+    for index in (0, 1):
+        moved = now[index] - before[index]
+        # A counter that went backwards means the interface came back up, or the
+        # machine rebooted; neither is traffic.
+        if moved <= 0 or moved > MAX_SOCKET_DELTA:
+            out.append(0)
+            continue
+        out.append(max(0, moved - used[index]))
+    return out
+
+
+def sample_net(state: dict, today_key: str, rows: list, windows: dict,
+               interfaces: list | None = None) -> list:
+    """Fold one sample into the pending buffer. Returns the bytes added."""
+    first_run = state.get("started") is not True
+    sockets, apps = net_delta(state.get("sockets") or {}, rows, windows, first_run)
+    counters = clean_pair(interfaces) if interfaces is not None else [0, 0]
+    if not first_run and (counters[0] > 0 or counters[1] > 0):
+        residual = residual_traffic(state.get("interfaces"), counters,
+                                    sum_pairs(apps.values()))
+        if residual[0] > 0 or residual[1] > 0:
+            add_pair(apps, "other-traffic", residual)
+    state["sockets"] = sockets
+    state["interfaces"] = counters
+    state["started"] = True
+    pending = state.setdefault("pending", {})
+    bucket = pending.setdefault(today_key, {})
+    for app, pair in apps.items():
+        add_pair(bucket, app, pair)
+    if not bucket:
+        pending.pop(today_key, None)
+    return sum_pairs(apps.values())
+
+
+def merge_net(store: dict, pending: object) -> list:
+    """Fold {day: {app: [down, up]}} into the store. Returns bytes added."""
+    if not isinstance(pending, dict):
+        return [0, 0]
+    days = store.setdefault("days", {})
+    added = [0, 0]
+    for raw_day, apps in pending.items():
+        if not is_day_key(raw_day) or not isinstance(apps, dict):
+            continue
+        accepted: dict = {}
+        for raw_app, raw_pair in apps.items():
+            pair = clean_pair(raw_pair)
+            if pair[0] <= 0 and pair[1] <= 0:
+                continue
+            if pair[0] > MAX_BATCH_BYTES or pair[1] > MAX_BATCH_BYTES:
+                continue
+            add_pair(accepted, str(raw_app).strip() or "unknown", pair)
+        if not accepted:
+            continue
+        entry = days.setdefault(raw_day, {"total": 0, "apps": {}})
+        entry.setdefault("total", 0)
+        entry.setdefault("apps", {})
+        net = entry.setdefault("net", {})
+        batch = sum_pairs(accepted.values())
+        for app, pair in accepted.items():
+            add_pair(net, app, pair)
+        # Accumulated, not recomputed: the per-app map is emptied by pruning and
+        # the day's total has to outlive it.
+        total = clean_pair(entry.get("netTotal"))
+        total = [total[0] + batch[0], total[1] + batch[1]]
+        summed = sum_pairs(net.values())
+        entry["netTotal"] = [max(total[0], summed[0]), max(total[1], summed[1])]
+        added = [added[0] + batch[0], added[1] + batch[1]]
+    return added
+
+
+def drain_net(store: dict) -> list:
+    """Move whatever `netsample` has buffered into the store.
+
+    Called from `commit`, so the store is rewritten once a minute however often
+    the sampler runs.
+    """
+    state = load_net_state()
+    pending = state.get("pending") or {}
+    if not pending:
+        return [0, 0]
+    added = merge_net(store, pending)
+    state["pending"] = {}
+    save_net_state(state)
+    return added
+
+
+def net_for(store: dict, key: str) -> dict:
+    entry = store.get("days", {}).get(key)
+    if not isinstance(entry, dict):
+        return {}
+    net = entry.get("net")
+    return net if isinstance(net, dict) else {}
+
+
+def net_total_for(store: dict, key: str) -> list:
+    entry = store.get("days", {}).get(key)
+    if not isinstance(entry, dict):
+        return [0, 0]
+    total = clean_pair(entry.get("netTotal"))
+    summed = sum_pairs(net_for(store, key).values())
+    return [max(total[0], summed[0]), max(total[1], summed[1])]
+
+
+def net_list(net: dict, limit: int = 0) -> list:
+    """Rows for the data-usage view, busiest first."""
+    rows = sorted(net.items(), key=lambda kv: (-(kv[1][0] + kv[1][1]), kv[0]))
+    if limit > 0:
+        rows = rows[:limit]
+    out = []
+    for app, pair in rows:
+        summary = net_summary(pair)
+        summary.update({"id": app, "app": app, "name": pretty_name(app)})
+        out.append(summary)
+    return out
+
+
+def rolling_net(store: dict, days: int, today: date) -> list:
+    total = [0, 0]
+    for step in range(days):
+        pair = net_total_for(store, day_key(today - timedelta(days=step)))
+        total = [total[0] + pair[0], total[1] + pair[1]]
+    return total
 
 
 # ------------------------------------------------------------------ snapshot
@@ -413,7 +1166,7 @@ def apps_for(store: dict, key: str) -> dict:
     return apps if isinstance(apps, dict) else {}
 
 
-def app_list(apps: dict, total: int, limit: int = 0) -> list:
+def app_list(apps: dict, total: int, limit: int = 0, net: dict | None = None) -> list:
     """Rows for the UI.
 
     A key of "com.mitchellh.ghostty/opencode" becomes name "opencode" with
@@ -424,11 +1177,12 @@ def app_list(apps: dict, total: int, limit: int = 0) -> list:
     if limit > 0:
         rows = rows[:limit]
     denominator = max(1, total)
+    traffic = net or {}
     out = []
     for key, secs in rows:
         app, detail = split_key(key)
         host = pretty_name(app)
-        out.append({
+        row = {
             "id": key,
             "app": app,
             "name": detail or host,
@@ -437,7 +1191,14 @@ def app_list(apps: dict, total: int, limit: int = 0) -> list:
             "seconds": secs,
             "share": round(secs / denominator, 4),
             "label": format_duration(secs),
-        })
+        }
+        # Bytes are only ever known per app, never per detail row: which tab
+        # downloaded what is not something the socket table can answer, and
+        # repeating the app's total on each of its children would read as if it
+        # were counted several times.
+        row["net"] = net_summary(traffic.get(app)) if not detail else net_summary(None)
+        row["netKnown"] = not detail and app in traffic
+        out.append(row)
     return out
 
 
@@ -450,7 +1211,7 @@ def merge_by_app(apps: dict) -> dict:
     return out
 
 
-def app_tree(apps: dict, total: int, limit: int = 0) -> list:
+def app_tree(apps: dict, total: int, limit: int = 0, net: dict | None = None) -> list:
     """The breakdown as folders: one node per app, detail as its children.
 
     Ghostty is the folder, `grok` and `claude` are what is inside it. An app
@@ -460,7 +1221,12 @@ def app_tree(apps: dict, total: int, limit: int = 0) -> list:
     When an app has both resolved detail and plain time — time from before
     detail existed, or a window whose title said nothing — the leftover is
     emitted as an "other" child so the children always account for the parent.
+
+    An app that moved data without ever holding focus still gets a row, at the
+    bottom with no time on it: a download that finished while the screen was
+    locked is exactly the thing you open this panel to find.
     """
+    traffic = net or {}
     grouped: dict = {}
     for key, secs in apps.items():
         app, detail = split_key(key)
@@ -468,9 +1234,14 @@ def app_tree(apps: dict, total: int, limit: int = 0) -> list:
         node["total"] += to_int(secs)
         if detail:
             node["children"][detail] = node["children"].get(detail, 0) + to_int(secs)
+    for app in traffic:
+        grouped.setdefault(app, {"total": 0, "children": {}})
 
     denominator = max(1, total)
-    rows = sorted(grouped.items(), key=lambda kv: (-kv[1]["total"], kv[0]))
+    rows = sorted(
+        grouped.items(),
+        key=lambda kv: (-kv[1]["total"], -sum(clean_pair(traffic.get(kv[0]))), kv[0]),
+    )
     if limit > 0:
         rows = rows[:limit]
 
@@ -492,6 +1263,8 @@ def app_tree(apps: dict, total: int, limit: int = 0) -> list:
             "seconds": node["total"],
             "share": round(node["total"] / denominator, 4),
             "label": format_duration(node["total"]),
+            "net": net_summary(traffic.get(app)),
+            "netKnown": app in traffic,
             "children": [
                 {
                     "id": app + "/" + name,
@@ -503,6 +1276,8 @@ def app_tree(apps: dict, total: int, limit: int = 0) -> list:
                     "share": round(secs / denominator, 4),
                     "parentShare": round(secs / max(1, node["total"]), 4),
                     "label": format_duration(secs),
+                    "net": net_summary(None),
+                    "netKnown": False,
                     "children": [],
                 }
                 for name, secs in children
@@ -584,6 +1359,7 @@ def recent_days(store: dict, count: int, goal_seconds: int, today: date) -> list
             "level": level_for(seconds, goal_seconds),
             "label": format_duration(seconds),
             "weekday": current.weekday(),
+            "net": net_summary(net_total_for(store, key)),
         })
     return out
 
@@ -629,6 +1405,7 @@ def build_snapshot(store: dict, goal_hours: int, monday_first: bool, year: int |
     today_key = day_key(today)
     today_total = total_for(store, today_key)
     today_apps = apps_for(store, today_key)
+    today_net = net_for(store, today_key)
     yesterday_total = total_for(store, day_key(today - timedelta(days=1)))
 
     week = recent_days(store, 7, goal_seconds, today)
@@ -648,12 +1425,22 @@ def build_snapshot(store: dict, goal_hours: int, monday_first: bool, year: int |
 
     month30_apps, month30_total = rolling_apps(store, 30, today)
 
+    # Every day with bytes on it, not just days with screen time: a machine that
+    # downloaded overnight has traffic and no usage.
+    net_days = [k for k in store.get("days", {}) if is_day_key(k)]
+    all_net = sum_pairs(net_total_for(store, k) for k in net_days)
+    range_net = sum_pairs(
+        net_total_for(store, k) for k in net_days
+        if start.isoformat() <= k <= end.isoformat()
+    )
+
     # A clicked heatmap box asks for one specific day's breakdown. Days whose
     # per-app detail has aged out still report a total, so the UI can say
     # "detail expired" rather than "no usage".
     selected_key = selected if is_day_key(selected) else ""
     selected_total = total_for(store, selected_key) if selected_key else 0
     selected_apps = apps_for(store, selected_key) if selected_key else {}
+    selected_net = net_for(store, selected_key) if selected_key else {}
 
     return {
         "ok": True,
@@ -662,9 +1449,9 @@ def build_snapshot(store: dict, goal_hours: int, monday_first: bool, year: int |
         "todayTotal": today_total,
         "todayLabel": format_duration(today_total),
         "todayLevel": level_for(today_total, goal_seconds),
-        "todayApps": app_list(today_apps, today_total),
-        "todayByApp": app_list(merge_by_app(today_apps), today_total),
-        "todayTree": app_tree(today_apps, today_total),
+        "todayApps": app_list(today_apps, today_total, 0, today_net),
+        "todayByApp": app_list(merge_by_app(today_apps), today_total, 0, today_net),
+        "todayTree": app_tree(today_apps, today_total, 0, today_net),
         "yesterdayTotal": yesterday_total,
         "yesterdayLabel": format_duration(yesterday_total),
         "goalHours": max(1, to_int(goal_hours)),
@@ -703,10 +1490,20 @@ def build_snapshot(store: dict, goal_hours: int, monday_first: bool, year: int |
         "selectedDay": selected_key,
         "selectedTotal": selected_total,
         "selectedLabel": format_duration(selected_total),
-        "selectedApps": app_list(selected_apps, selected_total),
-        "selectedByApp": app_list(merge_by_app(selected_apps), selected_total),
-        "selectedTree": app_tree(selected_apps, selected_total),
+        "selectedApps": app_list(selected_apps, selected_total, 0, selected_net),
+        "selectedByApp": app_list(merge_by_app(selected_apps), selected_total, 0, selected_net),
+        "selectedTree": app_tree(selected_apps, selected_total, 0, selected_net),
         "selectedDetailExpired": bool(selected_key and selected_total > 0 and not selected_apps),
+        "todayNet": net_summary(net_total_for(store, today_key)),
+        "todayNetApps": net_list(today_net),
+        "selectedNet": net_summary(net_total_for(store, selected_key) if selected_key else None),
+        "selectedNetApps": net_list(selected_net),
+        "weekNet": net_summary(rolling_net(store, 7, today)),
+        "rangeNet": net_summary(range_net),
+        "allTimeNet": net_summary(all_net),
+        # The UI keeps the data columns out of the way entirely until there is
+        # something to put in them.
+        "netTracked": bool(all_net[0] > 0 or all_net[1] > 0),
         "storePath": store_path(),
     }
 
@@ -720,21 +1517,54 @@ def emit(payload: dict) -> None:
 
 
 def cmd_commit(args) -> int:
-    store = load_store()
     payload = args.payload
     if payload == "-":
         payload = sys.stdin.read()
-    added = merge_commit(store, payload)
     today = date.today()
-    changed = added > 0
-    if args.prune:
-        changed = prune(store, args.retention, today) > 0 or changed
-    if changed:
-        save_store(store)
+    with Lock():
+        store = load_store()
+        added = merge_commit(store, payload)
+        # Bytes buffered by `netsample` land here, so the store is rewritten on
+        # the commit cadence rather than the sample cadence.
+        added_net = drain_net(store)
+        changed = added > 0 or added_net[0] > 0 or added_net[1] > 0
+        if args.prune:
+            changed = prune(store, args.retention, today) > 0 or changed
+        if changed:
+            save_store(store)
     snapshot = build_snapshot(store, args.goal, args.monday, args.year, today,
                               args.day, args.months, args.offset)
     snapshot["committed"] = added
+    snapshot["committedNet"] = added_net
     emit(snapshot)
+    return 0
+
+
+def cmd_netsample(args) -> int:
+    """One sample of the socket table into the pending buffer.
+
+    Cheap on purpose: it runs on a short timer, touches only the small state
+    file, and never rewrites history.json.
+    """
+    rows = parse_ss(run_ss())
+    windows = window_apps()
+    interfaces = read_interface_bytes()
+    with Lock():
+        state = load_net_state()
+        added = sample_net(state, day_key(date.today()), rows, windows, interfaces)
+        save_net_state(state)
+        pending = sum_pairs(
+            pair
+            for apps in (state.get("pending") or {}).values()
+            for pair in apps.values()
+        )
+    emit({
+        "ok": True,
+        "sockets": len(rows),
+        "down": added[0],
+        "up": added[1],
+        "pending": pending,
+    })
     return 0
 
 
@@ -747,26 +1577,60 @@ def cmd_snapshot(args) -> int:
 def cmd_today(args) -> int:
     store = load_store()
     today = date.today()
-    total = total_for(store, day_key(today))
-    print(f"Screen time today: {format_duration(total)}")
-    apps = apps_for(store, day_key(today))
-    if not apps:
+    key = day_key(today)
+    total = total_for(store, key)
+    net = net_for(store, key)
+    day_net = net_total_for(store, key)
+    headline = f"Screen time today: {format_duration(total)}"
+    if day_net[0] or day_net[1]:
+        headline += (f"  \u00b7  D {format_bytes(day_net[0])}"
+                     f"  U {format_bytes(day_net[1])}")
+    print(headline)
+    apps = apps_for(store, key)
+    if not apps and not net:
         print("  no usage recorded yet")
         return 0
 
     if args.group:
-        rows = [(row["name"], row) for row in app_list(merge_by_app(apps), total, 12)]
+        rows = [(row["name"], row) for row in app_list(merge_by_app(apps), total, 12, net)]
     else:
         rows = []
-        for node in app_tree(apps, total, 12):
+        for node in app_tree(apps, total, 12, net):
             rows.append((node["name"], node))
             for child in node["children"]:
                 rows.append(("  \u2514 " + child["name"], child))
 
     width = max(len(label) for label, _ in rows)
+    show_net = bool(net)
     for label, row in rows:
         bar = "\u2588" * max(1, round(row["share"] * 24))
-        print(f"  {label:<{width}}  {row['label']:>7}  {bar}")
+        line = f"  {label:<{width}}  {row['label']:>7}"
+        if show_net:
+            data = row.get("net") or net_summary(None)
+            pair = (f"D {data['downLabel']}  U {data['upLabel']}"
+                    if row.get("netKnown") else "")
+            line += f"  {pair:<22}"
+        print(f"{line}  {bar}")
+    return 0
+
+
+def cmd_net(args) -> int:
+    """Per-app data usage: today, or whichever day --day names."""
+    store = load_store()
+    key = args.day if is_day_key(args.day) else day_key(date.today())
+    rows = net_list(net_for(store, key))
+    total = net_total_for(store, key)
+    when = "today" if key == day_key(date.today()) else key
+    print(f"Data usage {when}: D {format_bytes(total[0])}  U {format_bytes(total[1])}")
+    if not rows:
+        print("  nothing recorded yet")
+        return 0
+    width = max(len(row["name"]) for row in rows)
+    peak = max(row["total"] for row in rows) or 1
+    for row in rows:
+        bar = "\u2588" * max(1, round(row["total"] / peak * 20))
+        print(f"  {row['name']:<{width}}  D {row['downLabel']:>9}"
+              f"  U {row['upLabel']:>9}  {bar}")
     return 0
 
 
@@ -777,7 +1641,11 @@ def cmd_week(args) -> int:
     rows = recent_days(store, 7, goal, today)
     peak = max((row["seconds"] for row in rows), default=0)
     total = sum(row["seconds"] for row in rows)
-    print(f"Last 7 days: {format_duration(total)} (avg {format_duration(total // 7)}/day)")
+    week_net = rolling_net(store, 7, today)
+    headline = f"Last 7 days: {format_duration(total)} (avg {format_duration(total // 7)}/day)"
+    if week_net[0] or week_net[1]:
+        headline += f"  \u00b7  D {format_bytes(week_net[0])}  U {format_bytes(week_net[1])}"
+    print(headline)
     for row in rows:
         name = datetime.fromisoformat(row["date"]).strftime("%a %d %b")
         length = round(row["seconds"] / peak * 28) if peak else 0
@@ -820,10 +1688,11 @@ def cmd_json(args) -> int:
 
 
 def cmd_prune(args) -> int:
-    store = load_store()
-    dropped = prune(store, args.retention, date.today())
-    if dropped:
-        save_store(store)
+    with Lock():
+        store = load_store()
+        dropped = prune(store, args.retention, date.today())
+        if dropped:
+            save_store(store)
     print(f"pruned per-app detail from {dropped} day(s)")
     return 0
 
@@ -862,6 +1731,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     subs.add_parser("snapshot", help="print the snapshot the UI renders").set_defaults(func=cmd_snapshot)
     subs.add_parser("today", help="human-readable today").set_defaults(func=cmd_today)
+    subs.add_parser("net", help="per-app data usage").set_defaults(func=cmd_net)
+    subs.add_parser("netsample",
+                    help="sample per-socket byte counters into the pending buffer"
+                    ).set_defaults(func=cmd_netsample)
     subs.add_parser("week", help="human-readable last 7 days").set_defaults(func=cmd_week)
     subs.add_parser("year", help="ASCII contribution heatmap").set_defaults(func=cmd_year)
     subs.add_parser("json", help="dump the raw store").set_defaults(func=cmd_json)
@@ -880,7 +1753,7 @@ def main(argv: list) -> int:
     except BrokenPipeError:
         return 0
     except Exception as error:  # never let the bar see a traceback
-        if args.command in ("commit", "snapshot"):
+        if args.command in ("commit", "snapshot", "netsample"):
             emit({"ok": False, "error": str(error)[:240]})
             return 0
         print(f"screentime: {error}", file=sys.stderr)

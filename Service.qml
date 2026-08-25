@@ -50,6 +50,12 @@ Item {
 
   readonly property int sampleIntervalMs: 5000
   readonly property int commitIntervalMs: 60000
+  // Socket counters die with their socket, so this has to be a good deal
+  // shorter than the commit interval or short-lived connections go unmeasured.
+  readonly property int netSampleIntervalMs: 15000
+
+  // Per-app data usage, sampled from the TCP socket table.
+  readonly property bool trackNetwork: setting("trackNetwork", true) !== false
 
   // ---- published state the widget and panel read -------------------------
 
@@ -69,6 +75,11 @@ Item {
   readonly property var recentDays: Model.lastDays(snapshot.weekDays || [], 7)
   readonly property bool tracking: trackerState.lastActive === true
   readonly property string activeAppId: currentAppId
+  // Bytes seen by the sampler but not yet folded into the store, so `status`
+  // can show the collector is alive between commits.
+  property int netPendingDown: 0
+  property int netPendingUp: 0
+  property int netSockets: 0
 
   readonly property string currentAppId: {
     var top = ToplevelManager.activeToplevel
@@ -177,6 +188,7 @@ Item {
   property string _resolveTitle: ""
   property string _resolveOut: ""
   property bool _resolveQueued: false
+  property string _netOut: ""
 
   function commit() {
     if (committing) {
@@ -184,10 +196,6 @@ Item {
       return
     }
     observeNow()
-    if (Tracker.isEmpty(trackerState)) {
-      refresh()
-      return
-    }
     var payload = JSON.stringify(Tracker.commitPayload(trackerState))
     // Clear the buffer before the write returns. If the helper fails we lose
     // one batch; keeping it would risk double-counting on a partial success,
@@ -196,6 +204,9 @@ Item {
     committing = true
     _out = ""
     _err = ""
+    // Runs even with nothing accrued, because this is also what drains the
+    // network sampler's buffer, and data moves while the seat is idle. An empty
+    // payload with nothing pending does not rewrite the store.
     commitProc.command = helperArgs(["commit", payload, "--prune"])
     commitProc.running = true
   }
@@ -206,6 +217,17 @@ Item {
     _err = ""
     snapshotProc.command = helperArgs(["snapshot"])
     snapshotProc.running = true
+  }
+
+  // One pass over the socket table. Deliberately not chained to `commit`: the
+  // sampler has to run far more often than the store is rewritten, and it only
+  // touches its own small state file.
+  function sampleNetwork() {
+    if (!trackNetwork) return
+    if (netProc.running) return
+    _netOut = ""
+    netProc.command = [helperPath, "netsample"]
+    netProc.running = true
   }
 
   // argparse binds options declared on the parent parser *before* the
@@ -356,6 +378,45 @@ Item {
     onTriggered: root.commit()
   }
 
+  // The sampler is not gated on `shouldCount`: a download finishing while the
+  // screen is locked is still data you used, even though it is not screen time.
+  Timer {
+    id: netTimer
+    interval: root.netSampleIntervalMs
+    running: root.trackNetwork
+    repeat: true
+    triggeredOnStart: true
+    onTriggered: root.sampleNetwork()
+  }
+
+  Process {
+    id: netProc
+    running: false
+    command: []
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root._netOut = text
+    }
+    // Swallowed on purpose: `ss` writes warnings about sockets it could not
+    // read, and none of them are the user's problem.
+    stderr: StdioCollector { waitForEnd: true }
+    onExited: function (exitCode) {
+      if (exitCode !== 0) return
+      try {
+        var parsed = JSON.parse(String(root._netOut || "{}"))
+        if (parsed && parsed.ok === true) {
+          root.netSockets = Number(parsed.sockets) || 0
+          var pending = parsed.pending || [0, 0]
+          root.netPendingDown = Number(pending[0]) || 0
+          root.netPendingUp = Number(pending[1]) || 0
+        }
+      } catch (e) {
+        // A malformed reply is not worth surfacing: the next sample overwrites
+        // it, and the bytes are already banked in the state file either way.
+      }
+    }
+  }
+
   // Roll the day over at midnight even if nothing else happens: the buffer is
   // already split per day, this just makes the bar reset promptly.
   Timer {
@@ -432,6 +493,10 @@ Item {
       root.refresh()
       return "ok"
     }
+    function net(): string {
+      var today = root.snapshot.todayNet || Model.emptyNet()
+      return "D " + today.downLabel + " \u00b7 U " + today.upLabel
+    }
     function status(): string {
       return JSON.stringify({
         today: root.todayLabel,
@@ -448,6 +513,10 @@ Item {
         overGoal: root.overGoal,
         pending: root.trackerState.pendingSeconds || 0,
         droppedGaps: root.trackerState.droppedGaps || 0,
+        trackNetwork: root.trackNetwork,
+        netToday: root.snapshot.todayNet || Model.emptyNet(),
+        netPending: [root.netPendingDown, root.netPendingUp],
+        netSockets: root.netSockets,
         weeks: (root.snapshot.weeks || []).length,
         range: root.snapshot.rangeLabel || "",
         months: root.historyMonths,

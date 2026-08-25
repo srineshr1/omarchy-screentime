@@ -360,3 +360,86 @@ test("parseSnapshot carries the range fields through", () => {
   assert.equal(parsed.rangeTotalLabel, "2h")
   assert.equal(parsed.canGoBack, true)
 })
+
+test("formatBytes uses decimal units, matching the engine", () => {
+  assert.equal(Model.formatBytes(0), "0 B")
+  assert.equal(Model.formatBytes(999), "999 B")
+  assert.equal(Model.formatBytes(1000), "1.0 kB")
+  assert.equal(Model.formatBytes(1500), "1.5 kB")
+  assert.equal(Model.formatBytes(12000), "12 kB")
+  assert.equal(Model.formatBytes(9400000), "9.4 MB")
+  assert.equal(Model.formatBytes(1234567890), "1.2 GB")
+  assert.equal(Model.formatBytes(5e12), "5.0 TB")
+})
+
+test("formatBytes treats junk as nothing rather than NaN", () => {
+  assert.equal(Model.formatBytes(-5), "0 B")
+  assert.equal(Model.formatBytes(null), "0 B")
+  assert.equal(Model.formatBytes(undefined), "0 B")
+  assert.equal(Model.formatBytes("nonsense"), "0 B")
+})
+
+test("formatBytesShort drops the space so the column stays narrow", () => {
+  assert.equal(Model.formatBytesShort(1234567890), "1.2G")
+  assert.equal(Model.formatBytesShort(9400000), "9.4M")
+  assert.equal(Model.formatBytesShort(12000), "12K")
+  assert.equal(Model.formatBytesShort(500), "500B")
+})
+
+test("netLabel puts down first and stays quiet when nothing was measured", () => {
+  assert.equal(Model.netLabel({ down: 1234567890, up: 45000000 }, true),
+    "D 1.2G  U 45M")
+  assert.equal(Model.netLabel({ down: 1234567890, up: 45000000 }, false),
+    "D 1.2 GB \u00b7 U 45 MB")
+  // A detail row inside a folder has no traffic of its own, and a confident
+  // "D 0 B" there would be a lie.
+  assert.equal(Model.netLabel({ down: 0, up: 0 }, true), "")
+  assert.equal(Model.netLabel(null, true), "")
+  assert.equal(Model.netLabel(undefined, false), "")
+})
+
+test("netLabel reports an app that only uploaded", () => {
+  assert.equal(Model.netLabel({ down: 0, up: 2000 }, true), "D 0B  U 2.0K")
+})
+
+test("emptyNet is a safe zero", () => {
+  const net = Model.emptyNet()
+  assert.equal(net.down, 0)
+  assert.equal(net.downLabel, "0 B")
+  assert.equal(typeof net.label, "string")
+})
+
+test("emptySnapshot declares the net fields", () => {
+  const empty = Model.emptySnapshot()
+  assert.equal(empty.netTracked, false)
+  assert.equal(empty.todayNet.down, 0)
+  assert.equal(empty.selectedNet.up, 0)
+  assert.deepEqual(empty.todayNetApps, [])
+  assert.equal(empty.allTimeNet.downLabel, "0 B")
+})
+
+test("dayTooltip adds the day's data usage on a second line", () => {
+  assert.equal(
+    Model.dayTooltip({
+      date: "2026-08-24", seconds: 16200, label: "4h 30m",
+      net: { down: 2000000, up: 250000 }
+    }),
+    "4h 30m \u00b7 24 Aug 2026\nD 2.0 MB \u00b7 U 250 kB")
+  // A day with no traffic keeps the single-line tooltip it always had.
+  assert.equal(
+    Model.dayTooltip({ date: "2026-08-24", seconds: 16200, label: "4h 30m" }),
+    "4h 30m \u00b7 24 Aug 2026")
+})
+
+test("barTooltip mentions today's data when there is some", () => {
+  const snapshot = Model.emptySnapshot()
+  snapshot.goalSeconds = 21600
+  snapshot.goalHours = 6
+  snapshot.todayNet = { down: 3000000, up: 400000 }
+  assert.match(Model.barTooltip(snapshot, 3600), /D 3\.0 MB/)
+
+  const quiet = Model.emptySnapshot()
+  quiet.goalSeconds = 21600
+  quiet.goalHours = 6
+  assert.doesNotMatch(Model.barTooltip(quiet, 3600), /D 0 B/)
+})

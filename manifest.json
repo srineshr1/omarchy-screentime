@@ -27,6 +27,7 @@
       "detailLevel": "full",
       "weekStartsMonday": true,
       "detailRetentionDays": 120,
+      "trackNetwork": true,
       "ignoredApps": ""
     },
     "schema": [
@@ -75,6 +76,13 @@
         "description": "accent = theme accent like GitHub, traffic = green under limit through red over it.",
         "options": ["accent", "traffic"],
         "defaultValue": "accent"
+      },
+      {
+        "key": "trackNetwork",
+        "type": "boolean",
+        "label": "Track data usage per app",
+        "description": "Samples the TCP socket table so the breakdown shows how much each app downloaded (D) and uploaded (U). Reads only your own sockets; QUIC/HTTP3 traffic is not visible to it and undercounts.",
+        "defaultValue": true
       },
       {
         "key": "weekStartsMonday",

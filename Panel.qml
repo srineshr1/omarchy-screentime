@@ -57,6 +57,12 @@ Panel {
   readonly property int breakdownTotal: root.viewingPast
     ? Number(snapshot.selectedTotal) || 0
     : root.liveToday
+  readonly property var breakdownNet: root.viewingPast
+    ? snapshot.selectedNet
+    : snapshot.todayNet
+  // Nothing to show a column for until some traffic has been recorded, and the
+  // sampler can be switched off entirely.
+  readonly property bool showNet: snapshot.netTracked === true
   readonly property string breakdownTitle: root.viewingPast
     ? Model.formatLongDate(root.selectedDay).toUpperCase()
     : "TODAY"
@@ -285,7 +291,11 @@ Panel {
 
               Text {
                 anchors.verticalCenter: parent.verticalCenter
-                text: Model.formatDuration(root.breakdownTotal)
+                text: {
+                  var data = Model.netLabel(root.breakdownNet, true)
+                  var time = Model.formatDuration(root.breakdownTotal)
+                  return data ? data + " \u00b7 " + time : time
+                }
                 color: root.secondaryForeground
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.caption
@@ -361,6 +371,7 @@ Panel {
                   row: folder.modelData
                   expandable: folder.kids.length > 0
                   expanded: folder.open
+                  showNet: root.showNet
                   foreground: root.foreground
                   dim: root.secondaryForeground
                   accent: Color.accent
@@ -380,6 +391,7 @@ Panel {
                       width: folder.width
                       row: modelData
                       child: true
+                      showNet: root.showNet
                       foreground: root.foreground
                       dim: root.secondaryForeground
                       accent: Color.accent
@@ -545,8 +557,13 @@ Panel {
               id: weekMeta
               anchors.right: parent.right
               anchors.verticalCenter: parent.verticalCenter
-              text: root.snapshot.weekLabel + " \u00b7 "
-                + Model.formatDuration(root.snapshot.weekDailyAverage) + "/day"
+              text: {
+                var bits = [root.snapshot.weekLabel + " \u00b7 "
+                  + Model.formatDuration(root.snapshot.weekDailyAverage) + "/day"]
+                var data = Model.netLabel(root.snapshot.weekNet, true)
+                if (data) bits.push(data)
+                return bits.join(" \u00b7 ")
+              }
               color: root.secondaryForeground
               font.family: root.fontFamily
               font.pixelSize: Style.font.caption
@@ -642,6 +659,8 @@ Panel {
               if (root.snapshot.bestDay && root.snapshot.bestDay.seconds > 0)
                 bits.push("busiest " + Model.formatLongDate(root.snapshot.bestDay.date)
                   + " (" + root.snapshot.bestDay.label + ")")
+              var data = Model.netLabel(root.snapshot.allTimeNet, false)
+              if (data) bits.push(data + " all time")
               return bits.join(" \u00b7 ")
             }
             textFormat: Text.PlainText
