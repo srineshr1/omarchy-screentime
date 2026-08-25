@@ -11,7 +11,7 @@ last seven days as bars.
 ## Preview
 
 ![Screen Time in the Omarchy bar, with the popup panel open showing the per-app
-breakdown and the six-month contribution grid](docs/preview.png)
+breakdown and the six-month contribution grid](preview.png)
 
 ```
  Screen Time                        1 day under limit   ⟳
