@@ -39,6 +39,11 @@ import sys
 
 MAX_DETAIL = 40
 
+# Ceiling on the Hyprland socket reply we are willing to buffer before parsing.
+# The client list is normally tens of KB; a compositor gone wrong (or a hostile
+# peer on the runtime socket) must not be able to balloon this process.
+MAX_SOCKET_BYTES = 8 * 1000 * 1000
+
 # Terminals: the title holds the running program or the cwd.
 TERMINALS = {
     "com.mitchellh.ghostty", "ghostty",
@@ -461,10 +466,16 @@ def pid_for_window(app_id: str, title: str) -> int:
             sock.connect(path)
             sock.sendall(b"j/clients")
             chunks = []
+            total = 0
             while True:
                 block = sock.recv(65536)
                 if not block:
                     break
+                total += len(block)
+                if total > MAX_SOCKET_BYTES:
+                    # Over the ceiling: refuse the reply whole rather than
+                    # parse a truncated client list and guess from it.
+                    return 0
                 chunks.append(block)
         clients = json.loads(b"".join(chunks).decode("utf-8", "replace"))
     except (OSError, ValueError):

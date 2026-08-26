@@ -3,8 +3,13 @@
 
 import importlib.machinery
 import importlib.util
+import json
 import os
+import socket
+import tempfile
+import threading
 import unittest
+from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SCRIPT = os.path.join(HERE, "..", "bin", "resolve-focus")
@@ -251,6 +256,63 @@ class TestProcessHelpers(unittest.TestCase):
         # Our own process is python running a script; the script wins.
         name = resolver.cmdline_name(os.getpid())
         self.assertNotIn(name.lower(), ("python", "python3"))
+
+
+class TestPidForWindow(unittest.TestCase):
+    """The resolver asks Hyprland which process owns the window it was given,
+    over the compositor's control socket."""
+
+    def ask(self, payload):
+        runtime = tempfile.TemporaryDirectory()
+        try:
+            instance = os.path.join(runtime.name, "hypr", "testsig")
+            os.makedirs(instance)
+            path = os.path.join(instance, ".socket.sock")
+            server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            server.bind(path)
+            server.listen(1)
+
+            def serve():
+                try:
+                    conn, _ = server.accept()
+                    with conn:
+                        conn.recv(256)
+                        conn.sendall(payload)
+                except OSError:
+                    pass
+
+            thread = threading.Thread(target=serve, daemon=True)
+            thread.start()
+            env = {
+                "HYPRLAND_INSTANCE_SIGNATURE": "testsig",
+                "XDG_RUNTIME_DIR": runtime.name,
+            }
+            try:
+                with mock.patch.dict(os.environ, env):
+                    return resolver.pid_for_window(
+                        GHOSTTY, "opencode")
+            finally:
+                server.close()
+                thread.join(timeout=2)
+        finally:
+            runtime.cleanup()
+
+    def test_the_window_owner_is_returned(self):
+        clients = [{"class": GHOSTTY, "title": "opencode", "pid": 4242}]
+        self.assertEqual(self.ask(json.dumps(clients).encode()), 4242)
+
+    def test_no_matching_client_means_no_pid(self):
+        clients = [{"class": "helium", "title": "other", "pid": 7}]
+        self.assertEqual(self.ask(json.dumps(clients).encode()), 0)
+
+    def test_garbage_json_reads_as_no_pid(self):
+        self.assertEqual(self.ask(b"not json"), 0)
+
+    def test_an_oversized_reply_is_refused_whole(self):
+        # A reply past the ceiling is refused rather than parsed truncated:
+        # half a client list could match the wrong window's pid.
+        with mock.patch.object(resolver, "MAX_SOCKET_BYTES", 64):
+            self.assertEqual(self.ask(b"x" * 8192), 0)
 
 
 if __name__ == "__main__":

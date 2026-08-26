@@ -9,8 +9,10 @@ import importlib.util
 import io
 import json
 import os
+import socket
 import sys
 import tempfile
+import threading
 import unittest
 from datetime import date, timedelta
 from unittest import mock
@@ -1319,6 +1321,76 @@ class TestByteFormatting(unittest.TestCase):
         summary = engine.net_summary([2000, 1000])
         self.assertEqual(summary["label"], "D 2.0 kB \u00b7 U 1.0 kB")
         self.assertEqual(summary["total"], 3000)
+
+
+class FakeHyprSocket:
+    """A stand-in for Hyprland's control socket: one request, one reply."""
+
+    def __init__(self, payload):
+        self.runtime = tempfile.TemporaryDirectory()
+        instance = os.path.join(self.runtime.name, "hypr", "testsig")
+        os.makedirs(instance)
+        self.path = os.path.join(instance, ".socket.sock")
+        self._server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self._server.bind(self.path)
+        self._server.listen(1)
+        self._thread = threading.Thread(target=self._serve, args=(payload,),
+                                        daemon=True)
+        self._thread.start()
+
+    def _serve(self, payload):
+        try:
+            conn, _ = self._server.accept()
+            with conn:
+                conn.recv(256)
+                conn.sendall(payload)
+        except OSError:
+            pass
+
+    def close(self):
+        self._server.close()
+        self._thread.join(timeout=2)
+        self.runtime.cleanup()
+
+
+class TestBoundedProducers(unittest.TestCase):
+    """Nothing here controls how large an external producer's output can get,
+    so every reply is read under a hard ceiling instead of being buffered
+    whole and only then handed to json.loads."""
+
+    def ask_hyprland(self, payload):
+        fake = FakeHyprSocket(payload)
+        try:
+            env = {
+                "HYPRLAND_INSTANCE_SIGNATURE": "testsig",
+                "XDG_RUNTIME_DIR": fake.runtime.name,
+            }
+            with mock.patch.dict(os.environ, env):
+                return engine.hypr_request(b"j/clients")
+        finally:
+            fake.close()
+
+    def test_a_normal_socket_reply_is_parsed(self):
+        clients = [{"class": "helium", "title": "x - YouTube - Helium", "pid": 42}]
+        self.assertEqual(self.ask_hyprland(json.dumps(clients).encode()), clients)
+
+    def test_an_oversized_reply_is_refused_whole(self):
+        # Half a picture is worse than none: window_apps would otherwise act
+        # on whichever clients happened to fit before the cut.
+        with mock.patch.object(engine, "MAX_HYPR_BYTES", 64):
+            self.assertIsNone(self.ask_hyprland(b"x" * 8192))
+
+    def test_run_ss_caps_an_oversized_producer(self):
+        flood = [sys.executable, "-c",
+                 "import sys; sys.stdout.write('x' * 100000)"]
+        with mock.patch.object(engine, "MAX_SS_BYTES", 1000):
+            text = engine.run_ss(flood)
+        self.assertIsInstance(text, str)
+        self.assertLessEqual(len(text), 1000)
+
+    def test_run_ss_passes_a_normal_producer_through(self):
+        text = engine.run_ss([sys.executable, "-c", "print('socket row')"])
+        self.assertIn("socket row", text)
 
 
 class TestLock(StoreTestCase):

@@ -57,6 +57,16 @@ Item {
   // Per-app data usage, sampled from the TCP socket table.
   readonly property bool trackNetwork: setting("trackNetwork", true) !== false
 
+  // Producer byte ceilings. Every helper is read through StdioCollector,
+  // which buffers the whole stream, so what we keep is clamped here rather
+  // than trusting each producer to stay small:
+  //   * snapshot replies scale with the store (months x days x apps);
+  //   * the resolver and netsample print one tiny JSON object each;
+  //   * stderr is only ever surfaced as a short error label.
+  readonly property int maxSnapshotBytes: 4 * 1024 * 1024
+  readonly property int maxReplyBytes: 64 * 1024
+  readonly property int maxStderrBytes: 4096
+
   // ---- published state the widget and panel read -------------------------
 
   property var snapshot: Model.emptySnapshot()
@@ -124,6 +134,14 @@ Item {
   function setting(name, fallback) {
     var value = settings ? settings[name] : undefined
     return value === undefined || value === null ? fallback : value
+  }
+
+  // Hard ceiling on text kept from a helper stream. A producer that runs past
+  // it loses its tail; JSON.parse then fails and the normal error path runs,
+  // which beats holding or parsing an unbounded string.
+  function bounded(text, maxBytes) {
+    var raw = String(text === undefined || text === null ? "" : text)
+    return raw.length > maxBytes ? raw.slice(0, maxBytes) : raw
   }
 
   // ---- accrual -----------------------------------------------------------
@@ -343,7 +361,7 @@ Item {
     command: []
     stdout: StdioCollector {
       waitForEnd: true
-      onStreamFinished: root._resolveOut = text
+      onStreamFinished: root._resolveOut = root.bounded(text, root.maxReplyBytes)
     }
     stderr: StdioCollector { waitForEnd: true }
     onExited: function (exitCode) {
@@ -395,7 +413,7 @@ Item {
     command: []
     stdout: StdioCollector {
       waitForEnd: true
-      onStreamFinished: root._netOut = text
+      onStreamFinished: root._netOut = root.bounded(text, root.maxReplyBytes)
     }
     // Swallowed on purpose: `ss` writes warnings about sockets it could not
     // read, and none of them are the user's problem.
@@ -439,11 +457,11 @@ Item {
     command: []
     stdout: StdioCollector {
       waitForEnd: true
-      onStreamFinished: root._out = text
+      onStreamFinished: root._out = root.bounded(text, root.maxSnapshotBytes)
     }
     stderr: StdioCollector {
       waitForEnd: true
-      onStreamFinished: root._err = text
+      onStreamFinished: root._err = root.bounded(text, root.maxStderrBytes)
     }
     onExited: function (exitCode) {
       root.committing = false
@@ -462,11 +480,11 @@ Item {
     command: []
     stdout: StdioCollector {
       waitForEnd: true
-      onStreamFinished: root._out = text
+      onStreamFinished: root._out = root.bounded(text, root.maxSnapshotBytes)
     }
     stderr: StdioCollector {
       waitForEnd: true
-      onStreamFinished: root._err = text
+      onStreamFinished: root._err = root.bounded(text, root.maxStderrBytes)
     }
     onExited: function (exitCode) {
       root.applySnapshot(root._out, root._err)

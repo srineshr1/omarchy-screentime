@@ -42,10 +42,12 @@ import fcntl
 import json
 import os
 import re
+import select
 import socket
 import subprocess
 import sys
 import tempfile
+import time
 from datetime import date, datetime, timedelta
 
 VERSION = 1
@@ -742,6 +744,17 @@ MAX_SOCKET_DELTA = 64 * 1000 ** 3
 # genuinely large download.
 MAX_BATCH_BYTES = 1000 ** 4
 
+# Producer byte ceilings. Nothing here controls how large these outputs can
+# get, so every external producer is read under a hard cap instead of being
+# drained into memory whole:
+#   * MAX_HYPR_BYTES caps a Hyprland control-socket reply before it is joined
+#     and parsed; the client list is normally tens of KB.
+#   * MAX_SS_BYTES caps one `ss` dump; its size tracks this user's live
+#     sockets and is normally well under a MB.
+MAX_HYPR_BYTES = 8 * 1000 * 1000
+MAX_SS_BYTES = 4 * 1000 * 1000
+SS_TIMEOUT_SEC = 5.0
+
 _PROC_STAT_CACHE: dict = {}
 
 
@@ -814,15 +827,52 @@ def parse_ss(text: str) -> list:
     return rows
 
 
-def run_ss() -> str:
+def run_ss(argv=None) -> str:
+    """One `ss` dump, read under a byte ceiling and a deadline.
+
+    capture_output would buffer whatever `ss` produces with no bound; this
+    reads the pipe in chunks and kills the producer the moment either limit
+    trips. A truncated tail parses as a short socket row at worst, never as
+    wrong numbers: rows are line-delimited and each carries its own counters.
+    """
     try:
-        result = subprocess.run(
-            ["ss", "-tinepH", "state", "connected"],
-            capture_output=True, text=True, timeout=5, check=False,
+        proc = subprocess.Popen(
+            argv or ["ss", "-tinepH", "state", "connected"],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
         )
+    except OSError:
+        return ""
+    pieces: list = []
+    total = 0
+    deadline = time.monotonic() + SS_TIMEOUT_SEC
+    fd = proc.stdout.fileno()
+    try:
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            ready, _, _ = select.select([fd], [], [], remaining)
+            if not ready:
+                break
+            block = os.read(fd, 65536)
+            if not block:
+                break
+            if total + len(block) > MAX_SS_BYTES:
+                break
+            pieces.append(block)
+            total += len(block)
+        proc.kill()
+        proc.wait(timeout=SS_TIMEOUT_SEC)
     except (OSError, subprocess.SubprocessError):
         return ""
-    return result.stdout or ""
+    finally:
+        try:
+            proc.stdout.close()
+        except OSError:
+            pass
+    # A truncated table still diffs safely: sockets missing from one sample
+    # simply contribute no delta on that tick.
+    return b"".join(pieces).decode("utf-8", "replace")
 
 
 def hypr_request(command: bytes) -> object:
@@ -838,10 +888,16 @@ def hypr_request(command: bytes) -> object:
             sock.connect(path)
             sock.sendall(command)
             chunks = []
+            total = 0
             while True:
                 block = sock.recv(65536)
                 if not block:
                     break
+                total += len(block)
+                if total > MAX_HYPR_BYTES:
+                    # Over the ceiling: refuse the reply whole rather than
+                    # parse a truncated one and act on half a picture.
+                    return None
                 chunks.append(block)
         return json.loads(b"".join(chunks).decode("utf-8", "replace"))
     except (OSError, ValueError):
