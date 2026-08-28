@@ -3,6 +3,7 @@ import Quickshell
 import Quickshell.Io
 import Quickshell.Wayland
 import "lib/Model.js" as Model
+import "lib/Stream.js" as Stream
 import "lib/Tracker.js" as Tracker
 
 // The screen time tracker. Loaded as a `service`, so it runs for the whole
@@ -57,9 +58,10 @@ Item {
   // Per-app data usage, sampled from the TCP socket table.
   readonly property bool trackNetwork: setting("trackNetwork", true) !== false
 
-  // Producer byte ceilings. Every helper is read through StdioCollector,
-  // which buffers the whole stream, so what we keep is clamped here rather
-  // than trusting each producer to stay small:
+  // Producer byte ceilings. Every helper is read through BoundedReader, which
+  // enforces these *while the producer runs* and cuts it off at the limit —
+  // rather than letting the whole stream into the shell and trimming what is
+  // kept, which bounds the wrong thing. See BoundedReader.qml.
   //   * snapshot replies scale with the store (months x days x apps);
   //   * the resolver and netsample print one tiny JSON object each;
   //   * stderr is only ever surfaced as a short error label.
@@ -127,21 +129,11 @@ Item {
   readonly property bool shouldCount: currentAppId.length > 0 && !seatIdle && !appIgnored
 
   property var trackerState: Tracker.emptyState()
-  property string _out: ""
-  property string _err: ""
   property bool _pendingSnapshot: false
 
   function setting(name, fallback) {
     var value = settings ? settings[name] : undefined
     return value === undefined || value === null ? fallback : value
-  }
-
-  // Hard ceiling on text kept from a helper stream. A producer that runs past
-  // it loses its tail; JSON.parse then fails and the normal error path runs,
-  // which beats holding or parsing an unbounded string.
-  function bounded(text, maxBytes) {
-    var raw = String(text === undefined || text === null ? "" : text)
-    return raw.length > maxBytes ? raw.slice(0, maxBytes) : raw
   }
 
   // ---- accrual -----------------------------------------------------------
@@ -184,7 +176,8 @@ Item {
     }
     _resolveApp = currentAppId
     _resolveTitle = currentTitle
-    _resolveOut = ""
+    resolveOut.reset()
+    resolveErr.reset()
     resolveProc.command = [resolverPath, _resolveApp, _resolveTitle, detailLevel]
     resolveProc.running = true
   }
@@ -204,9 +197,7 @@ Item {
 
   property string _resolveApp: ""
   property string _resolveTitle: ""
-  property string _resolveOut: ""
   property bool _resolveQueued: false
-  property string _netOut: ""
 
   function commit() {
     if (committing) {
@@ -220,8 +211,8 @@ Item {
     // and over-reporting screen time is the worse failure for this plugin.
     trackerState = Tracker.drained(trackerState)
     committing = true
-    _out = ""
-    _err = ""
+    commitOut.reset()
+    commitErr.reset()
     // Runs even with nothing accrued, because this is also what drains the
     // network sampler's buffer, and data moves while the seat is idle. An empty
     // payload with nothing pending does not rewrite the store.
@@ -231,8 +222,8 @@ Item {
 
   function refresh() {
     if (snapshotProc.running) return
-    _out = ""
-    _err = ""
+    snapshotOut.reset()
+    snapshotErr.reset()
     snapshotProc.command = helperArgs(["snapshot"])
     snapshotProc.running = true
   }
@@ -243,7 +234,8 @@ Item {
   function sampleNetwork() {
     if (!trackNetwork) return
     if (netProc.running) return
-    _netOut = ""
+    netOut.reset()
+    netErr.reset()
     netProc.command = [helperPath, "netsample"]
     netProc.running = true
   }
@@ -359,16 +351,25 @@ Item {
     id: resolveProc
     running: false
     command: []
-    stdout: StdioCollector {
-      waitForEnd: true
-      onStreamFinished: root._resolveOut = root.bounded(text, root.maxReplyBytes)
+    stdout: BoundedReader {
+      id: resolveOut
+      producer: resolveProc
+      maxBytes: root.maxReplyBytes
     }
-    stderr: StdioCollector { waitForEnd: true }
+    // Read but not kept: the resolver's own diagnostics are not the user's
+    // problem. Draining it anyway is deliberate — an unread pipe fills up and
+    // blocks the helper mid-write instead of letting it exit.
+    stderr: BoundedReader {
+      id: resolveErr
+      producer: resolveProc
+      maxBytes: 0
+      stopOnOverflow: false
+    }
     onExited: function (exitCode) {
       var detail = ""
-      if (exitCode === 0) {
+      if (exitCode === 0 && !resolveOut.overflowed) {
         try {
-          var parsed = JSON.parse(String(root._resolveOut || "{}"))
+          var parsed = JSON.parse(String(resolveOut.collected() || "{}"))
           if (parsed && parsed.app === root._resolveApp)
             detail = Tracker.normalizeDetail(parsed.detail)
         } catch (e) {
@@ -411,17 +412,25 @@ Item {
     id: netProc
     running: false
     command: []
-    stdout: StdioCollector {
-      waitForEnd: true
-      onStreamFinished: root._netOut = root.bounded(text, root.maxReplyBytes)
+    stdout: BoundedReader {
+      id: netOut
+      producer: netProc
+      maxBytes: root.maxReplyBytes
     }
     // Swallowed on purpose: `ss` writes warnings about sockets it could not
-    // read, and none of them are the user's problem.
-    stderr: StdioCollector { waitForEnd: true }
+    // read, and none of them are the user's problem. Kept at zero rather than
+    // left unread, so a chatty run drains instead of filling the pipe, and
+    // never cuts the sample short.
+    stderr: BoundedReader {
+      id: netErr
+      producer: netProc
+      maxBytes: 0
+      stopOnOverflow: false
+    }
     onExited: function (exitCode) {
-      if (exitCode !== 0) return
+      if (exitCode !== 0 || netOut.overflowed) return
       try {
-        var parsed = JSON.parse(String(root._netOut || "{}"))
+        var parsed = JSON.parse(String(netOut.collected() || "{}"))
         if (parsed && parsed.ok === true) {
           root.netSockets = Number(parsed.sockets) || 0
           var pending = parsed.pending || [0, 0]
@@ -455,18 +464,29 @@ Item {
     id: commitProc
     running: false
     command: []
-    stdout: StdioCollector {
-      waitForEnd: true
-      onStreamFinished: root._out = root.bounded(text, root.maxSnapshotBytes)
+    stdout: BoundedReader {
+      id: commitOut
+      producer: commitProc
+      maxBytes: root.maxSnapshotBytes
     }
-    stderr: StdioCollector {
-      waitForEnd: true
-      onStreamFinished: root._err = root.bounded(text, root.maxStderrBytes)
+    stderr: BoundedReader {
+      id: commitErr
+      producer: commitProc
+      maxBytes: root.maxStderrBytes
+      // Capped but never fatal. The ceiling is what bounds the allocation; a
+      // helper being noisy on stderr is not a reason to kill a commit, and the
+      // store has already been written by the time it prints anything anyway.
+      stopOnOverflow: false
     }
     onExited: function (exitCode) {
       root.committing = false
-      if (exitCode === 0) root.applySnapshot(root._out, root._err)
-      else root.lastError = Model.safeText(root._err, 240) || "Could not save screen time"
+      // Only stdout overflowing means the reply itself was too big to trust.
+      if (commitOut.overflowed)
+        root.lastError = Stream.overflowMessage("output")
+      else if (exitCode === 0)
+        root.applySnapshot(commitOut.collected(), commitErr.collected())
+      else
+        root.lastError = Model.safeText(commitErr.collected(), 240) || "Could not save screen time"
       if (root._pendingSnapshot) {
         root._pendingSnapshot = false
         Qt.callLater(root.refresh)
@@ -478,16 +498,22 @@ Item {
     id: snapshotProc
     running: false
     command: []
-    stdout: StdioCollector {
-      waitForEnd: true
-      onStreamFinished: root._out = root.bounded(text, root.maxSnapshotBytes)
+    stdout: BoundedReader {
+      id: snapshotOut
+      producer: snapshotProc
+      maxBytes: root.maxSnapshotBytes
     }
-    stderr: StdioCollector {
-      waitForEnd: true
-      onStreamFinished: root._err = root.bounded(text, root.maxStderrBytes)
+    stderr: BoundedReader {
+      id: snapshotErr
+      producer: snapshotProc
+      maxBytes: root.maxStderrBytes
+      stopOnOverflow: false
     }
     onExited: function (exitCode) {
-      root.applySnapshot(root._out, root._err)
+      if (snapshotOut.overflowed)
+        root.lastError = Stream.overflowMessage("output")
+      else
+        root.applySnapshot(snapshotOut.collected(), snapshotErr.collected())
     }
   }
 

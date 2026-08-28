@@ -234,6 +234,39 @@ Bytes buffer in a small side file and are folded into the store by the same
 60-second commit that banks screen time, so the store is not rewritten on the
 sampling cadence.
 
+## Reading from helpers
+
+The shell runs for the whole session, so anything it reads from a helper has to
+be bounded as it arrives, not after. Quickshell's `StdioCollector` cannot do
+that: it appends every chunk into one buffer and only hands the result to QML
+once the stream ends, so a ceiling applied to the finished text bounds what is
+*kept* rather than what was *taken*. A helper that ran away would already have
+been allocated inside the shell by the time any QML code could object.
+
+`BoundedReader.qml` reads through `SplitParser` with an empty split marker
+instead, which emits each chunk as it arrives and retains nothing of its own. It
+counts as it goes, stops retaining at the ceiling, and terminates the producer —
+escalating to `SIGKILL` if the producer writes more after being asked to stop.
+What remains is one chunk in flight, a transient the size of a pipe read rather
+than an accumulation the size of the output.
+
+| Stream | Ceiling | On overflow |
+| --- | --- | --- |
+| `snapshot` / `commit` stdout | 4 MB | Stop the helper, report the error |
+| resolver / `netsample` stdout | 64 KB | Stop the helper, drop the reply |
+| `snapshot` / `commit` stderr | 4 KB | Cap it, keep reading |
+| resolver / `netsample` stderr | nothing kept | Drain it, keep reading |
+
+stderr is capped but never fatal. The ceiling is what bounds the allocation, and
+killing a helper over noise on stderr would cost a committed batch for nothing.
+Nor is it left unread: an unread pipe fills up and blocks the helper mid-write
+instead of letting it exit. Killing a helper cannot lose data in any case —
+`commit` writes the store atomically, under a lock, before it prints anything.
+
+The helper side is bounded the same way, before any parse: a Hyprland control
+socket reply stops at 8 MB and is refused whole rather than parsed truncated,
+and one `ss` dump stops at 4 MB or five seconds, whichever comes first.
+
 ## Data
 
 One file:
@@ -306,15 +339,21 @@ omarchy-shell screentime flush    # commit buffered time now
 ## Development
 
 ```bash
-node --test "tests/*.test.mjs"          # pure JS logic (Model.js, Tracker.js)
-python3 -m unittest discover -s tests   # the data engine
+node --test "tests/*.test.mjs"          # pure JS logic (Model.js, Tracker.js, Stream.js)
+python3 -m unittest discover -s tests   # the data engine, and the QML read boundary
 omarchy plugin validate .               # same checks the shell runs at load
 ```
 
 `lib/Tracker.js` holds the accrual rules as pure functions — idle handling,
 suspend gaps, midnight splits, ignore rules — so what counts as screen time is
-testable without a compositor. `lib/Model.js` is presentation-only. Both are
-QML JS modules loaded under plain node by the test harness.
+testable without a compositor. `lib/Model.js` is presentation-only, and
+`lib/Stream.js` is the per-chunk ceiling arithmetic behind `BoundedReader.qml`.
+All three are QML JS modules loaded under plain node by the test harness.
+
+`tests/test_qml_reader.py` is the exception to that: whether the shell allocates
+a helper's whole output before QML can refuse it is not visible to any pure
+function, so those cases run a real headless Quickshell against a real producer
+and measure peak RSS from outside. They skip when Quickshell is not installed.
 
 Note that saving a file only hot-reloads when the plugin directory is a real
 directory under `~/.config/omarchy/plugins/`. If you symlink a working copy in,
